@@ -22,20 +22,13 @@ const formatarMac = (mac) => {
 // --- FUNÇÃO PARA CALCULAR PORCENTAGEM DA BATERIA ---
 const calcularBateria = (mVolts) => {
     if (!mVolts) return 0;
-
     const MAX_MV = 3600; // 100% (3.6V)
-    const MIN_MV = 2500; // 0%   (2.5V - Bateria morta)
+    const MIN_MV = 2500; // 0%   (2.5V)
 
-    // Se for maior que o máximo, trava em 100%
     if (mVolts >= MAX_MV) return 100;
-    
-    // Se for menor que o mínimo, trava em 0%
     if (mVolts <= MIN_MV) return 0;
 
-    // Cálculo gradual (Regra de três / Linear)
     const porcentagem = ((mVolts - MIN_MV) / (MAX_MV - MIN_MV)) * 100;
-
-    // Retorna arredondado (sem casas decimais)
     return Math.round(porcentagem);
 };
 
@@ -45,63 +38,66 @@ client.on('connect', () => {
 });
 
 client.on('message', async (topic, message) => {
-    const msgString = message.toString();
-
     try {
-        const payload = JSON.parse(msgString);
+        const msgString = message.toString();
+        let payload = JSON.parse(msgString);
+
+        // --- CORREÇÃO DO ANINHAMENTO (Achatando os arrays [[[[ ]]]]) ---
+        // Continua achatando enquanto o primeiro elemento for um array
+        while (Array.isArray(payload) && payload.length > 0 && Array.isArray(payload[0])) {
+            payload = payload.flat();
+        }
+
+        // Se após o flatten não for um array de objetos, forçamos a virar um array para o forEach
+        const gateways = Array.isArray(payload) ? payload : [payload];
         
         const leiturasParaSalvar = [];
 
-        if (Array.isArray(payload)) {
-            payload.forEach(batch => {
-                if (Array.isArray(batch)) {
-                    batch.forEach(gatewayMsg => {
-                        
-                        const gatewayMac = gatewayMsg.gmac;
+        gateways.forEach(gatewayMsg => {
+            const gatewayMac = gatewayMsg.gmac;
 
-                        console.log(`📡 Processando leituras do gateway '${gatewayMac}'`);
+            if (gatewayMac && gatewayMsg.obj && Array.isArray(gatewayMsg.obj)) {
+                console.log(`📡 Processando gateway: ${gatewayMac}`);
 
-                        if (gatewayMsg.obj && Array.isArray(gatewayMsg.obj)) {
-                            
-                            gatewayMsg.obj.forEach(sensor => {
-                                // FILTRO: Apenas type 1
-                                if (sensor.type === 1) {
-                                    
-                                    leiturasParaSalvar.push({
-                                        gw: formatarMac(gatewayMac),
-                                        mac: formatarMac(sensor.dmac),
-                                        rssi: sensor.rssi,
-                                        ts: sensor.time.replace(' ', 'T'),
-                                        
-                                       
-                                        batt: calcularBateria(sensor.vbatt), 
-                                        
-                                        temp: sensor.temp,
-                                        hum: sensor.humidity
-                                    });
-                                }
-                            });
-                        }
-                    });
-                }
-            });
-        }
+                gatewayMsg.obj.forEach(sensor => {
+                    // FILTRO: Apenas type 1 (Sensores de Telemetria)
+                    if (sensor.type === 1) {
+                        leiturasParaSalvar.push({
+                            gw: formatarMac(gatewayMac),
+                            mac: formatarMac(sensor.dmac),
+                            rssi: sensor.rssi,
+                            // Converte "2026-01-09 16:26:08.589" para ISO "2026-01-09T16:26:08.589"
+                            ts: sensor.time ? sensor.time.replace(' ', 'T') : new Date().toISOString(),
+                            batt: calcularBateria(sensor.vbatt),
+                            temp: sensor.temp,
+                            hum: sensor.humidity
+                        });
+                    }
+                });
+            }
+        });
 
         // --- SALVAR NO BANCO ---
         if (leiturasParaSalvar.length > 0) {
-            
             const { error } = await supabase
                 .from('telemetry_logs')
                 .insert(leiturasParaSalvar);
 
             if (error) {
                 console.error('❌ Erro ao salvar no Supabase:', error.message);
+                console.error('Detalhes do erro:', error);
             } else {
                 console.log(`💾 Sucesso! ${leiturasParaSalvar.length} registros inseridos.`);
             }
+        } else {
+            console.log('⚠️ Nenhuma leitura do tipo 1 encontrada no payload.');
         }
 
     } catch (e) {
-        console.error('❌ Erro ao processar:', e);
+        console.error('❌ Erro crítico ao processar mensagem:', e.message);
     }
+});
+
+client.on('error', (err) => {
+    console.error('❌ Erro de conexão MQTT:', err);
 });

@@ -10,8 +10,11 @@ dotenv.config();
 // --- CONFIGURAÇÕES ---
 const PORT = process.env.PORT || 3000;
 const BROKER_URL = 'mqtt://broker.hivemq.com';
+
+// TÓPICOS
 const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';
 const TOPIC_ALERTS = '/alcateia/alerts/summary';
+const TOPIC_GPS = '/alcateia/gateways/beacons/movel/prd_ble_data';
 
 // Tolerâncias para evitar ruído
 const TOLERANCIA_TEMP = 0.5;
@@ -41,7 +44,7 @@ const calcularBateria = (mVolts) => {
     return Math.round(((mVolts - MIN_MV) / (MAX_MV - MIN_MV)) * 100);
 };
 
-// Classificação de Severidade
+// Classificação de Severidade (Manteve-se igual)
 const classificarSeveridade = (tipo, valor, limite) => {
     let delta = 0;
     if (tipo === 'Temperatura') {
@@ -148,10 +151,9 @@ const processarAlertas = async (leituras) => {
 
 // --- FUNÇÃO: GERAR JSON ESTRUTURADO PARA AUTOMAÇÃO ---
 const gerarResumoAlertas = async () => {
+    // ... (Código do cron mantido igual ao original)
     console.log('📅 Gerando payload JSON estruturado...');
-    
     const agora = new Date();
-    // Busca alertas não processados dos últimos 40 min
     const janelaTempo = new Date(agora.getTime() - 40 * 60 * 1000); 
 
     const { data: logs, error } = await supabase
@@ -162,72 +164,41 @@ const gerarResumoAlertas = async () => {
 
     if (error || !logs || logs.length === 0) return;
 
-    // 1. Agrupamento e Estatísticas
     const grupos = { LEVE: [], MEDIA: [], URGENTE: [] };
     let totalTemp = 0, totalHum = 0, totalBatt = 0;
 
     logs.forEach(log => {
-        // Stats
         if (log.alert_type.includes('Temperatura')) totalTemp++;
         else if (log.alert_type.includes('Umidade')) totalHum++;
         else if (log.alert_type.includes('Bateria')) totalBatt++;
 
-        // Categorização
         let severidade = 'LEVE';
         if (log.alert_type.includes('[URGENTE]')) severidade = 'URGENTE';
         else if (log.alert_type.includes('[MEDIA]')) severidade = 'MEDIA';
         
-        // Estrutura Limpa
         grupos[severidade].push({
             sensor: log.display_name || log.sensor_mac,
             mac: log.sensor_mac,
-            problema: log.alert_type.split(' [')[0], // Remove a tag [MEDIA]
+            problema: log.alert_type.split(' [')[0],
             valor_lido: Number(log.read_value),
             valor_limite: Number(log.limit_value),
             horario: log.created_at
         });
     });
 
-    // 2. Definição de Estratégias (Flags para o n8n rotear)
     const strategies = {
-        urgente: {
-            has_alerts: grupos.URGENTE.length > 0,
-            count: grupos.URGENTE.length,
-            suggested_channel: "LIGACAO_VOZ"
-        },
-        media: {
-            has_alerts: grupos.MEDIA.length > 0,
-            count: grupos.MEDIA.length,
-            suggested_channel: "WHATSAPP"
-        },
-        leve: {
-            has_alerts: grupos.LEVE.length > 0,
-            count: grupos.LEVE.length,
-            suggested_channel: "LOG_OU_WHATSAPP"
-        }
+        urgente: { has_alerts: grupos.URGENTE.length > 0, count: grupos.URGENTE.length, suggested_channel: "LIGACAO_VOZ" },
+        media: { has_alerts: grupos.MEDIA.length > 0, count: grupos.MEDIA.length, suggested_channel: "WHATSAPP" },
+        leve: { has_alerts: grupos.LEVE.length > 0, count: grupos.LEVE.length, suggested_channel: "LOG_OU_WHATSAPP" }
     };
 
-    // 3. Montagem do Payload Final
     const payloadN8N = {
-        meta: {
-            timestamp: agora.toISOString(),
-            source: "Alcateia IoT Backend",
-            total_alerts: logs.length
-        },
+        meta: { timestamp: agora.toISOString(), source: "Alcateia IoT Backend", total_alerts: logs.length },
         strategies: strategies,
-        stats: {
-            temp_count: totalTemp,
-            hum_count: totalHum,
-            batt_count: totalBatt
-        },
-        details: {
-            urgente: grupos.URGENTE,
-            media: grupos.MEDIA,
-            leve: grupos.LEVE
-        }
+        stats: { temp_count: totalTemp, hum_count: totalHum, batt_count: totalBatt },
+        details: { urgente: grupos.URGENTE, media: grupos.MEDIA, leve: grupos.LEVE }
     };
 
-    // 4. Publica e Atualiza
     client.publish(TOPIC_ALERTS, JSON.stringify(payloadN8N), { qos: 1, retain: false });
     console.log(`📢 JSON enviado para ${TOPIC_ALERTS} (Total: ${logs.length})`);
 
@@ -241,7 +212,8 @@ cron.schedule('*/1 * * * *', () => gerarResumoAlertas());
 // MQTT Listen
 client.on('connect', () => {
     console.log('✅ Conectado ao MQTT!');
-    client.subscribe(TOPIC_DATA);
+    // Agora assinamos o tópico antigo E o novo tópico de GPS
+    client.subscribe([TOPIC_DATA, TOPIC_GPS]);
 });
 
 client.on('message', async (topic, message) => {
@@ -249,30 +221,54 @@ client.on('message', async (topic, message) => {
         const payload = JSON.parse(message.toString());
         let leituras = [];
 
-        if (payload.gw) {
+        // Verifica se é o formato simplificado antigo
+        if (payload.gw && !payload.obj) {
             leituras.push({ 
                 gw: formatarMac(payload.gw), mac: formatarMac(payload.mac), 
                 ts: payload.ts, batt: payload.batt, 
-                temp: payload.temp, hum: payload.hum, rssi: payload.rssi 
+                temp: payload.temp, hum: payload.hum, rssi: payload.rssi,
+                latitude: null, longitude: null, altitude: null // Default null para formato antigo
             });
         } else {
-            // Suporte legado
+            // Lógica Unificada (Suporta o legado e o novo formato com 'location')
+            // O novo formato chega como objeto único, então transformamos em array para usar o mesmo loop
             const raw = Array.isArray(payload) ? payload.flat(Infinity) : [payload];
+            
             raw.forEach(gw => {
-                if (gw.obj) gw.obj.filter(s => s.type === 1).forEach(s => {
-                    leituras.push({
-                        gw: formatarMac(gw.gmac),
-                        mac: formatarMac(s.dmac),
-                        ts: s.time ? s.time.replace(' ', 'T') : new Date().toISOString(),
-                        batt: calcularBateria(s.vbatt),
-                        temp: s.temp, hum: s.humidity, rssi: s.rssi
+                // Extração dos dados de GPS (se existirem no gateway)
+                let lat = null, lon = null, alt = null;
+                if (gw.location && gw.location.err === 0) {
+                    lat = gw.location.latitude;
+                    lon = gw.location.longitude;
+                    alt = gw.location.altitude;
+                }
+
+                // Processa a lista de objetos (sensores)
+                if (gw.obj) {
+                    // O filtro type === 1 remove automaticamente o type 128 e outros
+                    gw.obj.filter(s => s.type === 1).forEach(s => {
+                        leituras.push({
+                            gw: formatarMac(gw.gmac),
+                            mac: formatarMac(s.dmac),
+                            // Usa o timestamp do sensor ou do gateway (gw.location.time) ou atual
+                            ts: s.time ? s.time.replace(' ', 'T') : new Date().toISOString(),
+                            batt: calcularBateria(s.vbatt), // Converte mV para %
+                            temp: s.temp, 
+                            hum: s.humidity, 
+                            rssi: s.rssi,
+                            // Novos campos de GPS
+                            latitude: lat,
+                            longitude: lon,
+                            altitude: alt
+                        });
                     });
-                });
+                }
             });
         }
 
         if (leituras.length > 0) {
             await processarAlertas(leituras);
+            // O Supabase irá inserir latitude/longitude/altitude automaticamente se colunas existirem
             await supabase.from('telemetry_logs').insert(leituras);
         }
     } catch (e) {

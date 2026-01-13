@@ -13,12 +13,15 @@ const BROKER_URL = 'mqtt://broker.hivemq.com';
 const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';
 const TOPIC_ALERTS = '/alcateia/alerts/summary';
 
+// Tolerâncias para evitar ruído
+const TOLERANCIA_TEMP = 0.5;
+const TOLERANCIA_HUM = 2.0;
+
 // --- INICIALIZAÇÃO ---
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const client = mqtt.connect(BROKER_URL);
 
-// --- MIDDLEWARES ---
 app.use(cors());
 app.use(express.json());
 
@@ -38,13 +41,38 @@ const calcularBateria = (mVolts) => {
     return Math.round(((mVolts - MIN_MV) / (MAX_MV - MIN_MV)) * 100);
 };
 
-// --- FUNÇÃO: VERIFICAÇÃO DE ALERTAS (COM FILTRO DE DUPLICIDADE) ---
+// Classificação de Severidade
+const classificarSeveridade = (tipo, valor, limite) => {
+    let delta = 0;
+    if (tipo === 'Temperatura') {
+        delta = valor - limite;
+        if (delta <= TOLERANCIA_TEMP) return null;
+        if (delta < 2.0) return 'LEVE';
+        if (delta < 5.0) return 'MEDIA';
+        return 'URGENTE';
+    }
+    if (tipo === 'Umidade') {
+        delta = valor - limite;
+        if (delta <= TOLERANCIA_HUM) return null;
+        if (delta < 10) return 'LEVE';
+        if (delta < 20) return 'MEDIA';
+        return 'URGENTE';
+    }
+    if (tipo === 'Bateria') {
+        if (valor > limite) return null;
+        if (valor < 5) return 'URGENTE';
+        if (valor < 10) return 'MEDIA';
+        return 'LEVE';
+    }
+    return 'LEVE';
+};
+
+// --- FUNÇÃO: PROCESSAR E SALVAR NO BANCO ---
 const processarAlertas = async (leituras) => {
     if (leituras.length === 0) return;
     
     const macs = [...new Set(leituras.map(l => l.mac))];
     
-    // 1. Busca configurações
     const { data: configs, error } = await supabase
         .from('sensor_configs')
         .select('mac, display_name, temp_max, hum_max, batt_warning')
@@ -55,61 +83,75 @@ const processarAlertas = async (leituras) => {
     const configMap = new Map(configs.map(c => [c.mac, c]));
     const potenciaisAlertas = [];
 
-    // 2. Identifica violações de regras
     leituras.forEach(leitura => {
         const config = configMap.get(leitura.mac);
         if (!config) return;
 
+        let severidade = null;
+        let tipoAlerta = '';
+        let limite = 0;
+        let valor = 0;
+
         if (config.temp_max !== null && leitura.temp > config.temp_max) {
-            potenciaisAlertas.push({ sensor_mac: leitura.mac, gateway_mac: leitura.gw, display_name: config.display_name, alert_type: 'Temperatura', read_value: leitura.temp, limit_value: config.temp_max });
+            severidade = classificarSeveridade('Temperatura', leitura.temp, config.temp_max);
+            tipoAlerta = 'Temperatura';
+            limite = config.temp_max;
+            valor = leitura.temp;
         }
-        if (config.hum_max !== null && leitura.hum > config.hum_max) {
-            potenciaisAlertas.push({ sensor_mac: leitura.mac, gateway_mac: leitura.gw, display_name: config.display_name, alert_type: 'Umidade', read_value: leitura.hum, limit_value: config.hum_max });
+        else if (config.hum_max !== null && leitura.hum > config.hum_max) {
+            severidade = classificarSeveridade('Umidade', leitura.hum, config.hum_max);
+            tipoAlerta = 'Umidade';
+            limite = config.hum_max;
+            valor = leitura.hum;
         }
-        if (config.batt_warning !== null && leitura.batt < config.batt_warning) {
-            potenciaisAlertas.push({ sensor_mac: leitura.mac, gateway_mac: leitura.gw, display_name: config.display_name, alert_type: 'Bateria', read_value: leitura.batt, limit_value: config.batt_warning });
+        else if (config.batt_warning !== null && leitura.batt < config.batt_warning) {
+            severidade = classificarSeveridade('Bateria', leitura.batt, config.batt_warning);
+            tipoAlerta = 'Bateria';
+            limite = config.batt_warning;
+            valor = leitura.batt;
+        }
+
+        if (severidade) {
+            potenciaisAlertas.push({
+                sensor_mac: leitura.mac,
+                gateway_mac: leitura.gw,
+                display_name: config.display_name,
+                alert_type: `${tipoAlerta} [${severidade}]`,
+                read_value: valor,
+                limit_value: limite
+            });
         }
     });
 
     if (potenciaisAlertas.length === 0) return;
 
-    // 3. Verifica duplicidade no banco (Evitar spam do mesmo valor)
-    // Busca logs ativos (não processados) para esses sensores
     const macsComAlerta = [...new Set(potenciaisAlertas.map(a => a.sensor_mac))];
-    
-    const { data: logsExistentes, error: errLogs } = await supabase
+    const { data: logsExistentes } = await supabase
         .from('critical_logs')
         .select('sensor_mac, alert_type, read_value')
         .eq('processed', false)
         .in('sensor_mac', macsComAlerta);
 
-    if (errLogs) {
-        console.error('❌ Erro ao verificar duplicidade:', errLogs.message);
-        return; // Em caso de erro, aborta para segurança
-    }
-
-    // Filtra: Só mantém o alerta se NÃO existir um idêntico (mesmo MAC, Tipo e Valor) no banco
-    const alertasParaSalvar = potenciaisAlertas.filter(novoAlerta => {
-        const duplicado = logsExistentes.some(existente => 
-            existente.sensor_mac === novoAlerta.sensor_mac &&
-            existente.alert_type === novoAlerta.alert_type &&
-            existente.read_value === novoAlerta.read_value
+    const alertasParaSalvar = potenciaisAlertas.filter(novo => {
+        const duplicado = logsExistentes?.some(existente => 
+            existente.sensor_mac === novo.sensor_mac &&
+            existente.alert_type === novo.alert_type &&
+            existente.read_value === novo.read_value
         );
         return !duplicado;
     });
 
-    // 4. Salva apenas os novos
     if (alertasParaSalvar.length > 0) {
-        const { error: errInsert } = await supabase.from('critical_logs').insert(alertasParaSalvar);
-        if (errInsert) console.error('❌ Erro ao inserir alertas:', errInsert.message);
+        await supabase.from('critical_logs').insert(alertasParaSalvar);
     }
 };
 
-// --- LÓGICA: RESUMO E ATUALIZAÇÃO ---
+// --- FUNÇÃO: GERAR JSON ESTRUTURADO PARA AUTOMAÇÃO ---
 const gerarResumoAlertas = async () => {
-    console.log('📅 Iniciando geração de relatório de alertas...');
+    console.log('📅 Gerando payload JSON estruturado...');
     
     const agora = new Date();
+    // Busca alertas não processados dos últimos 40 min
     const janelaTempo = new Date(agora.getTime() - 40 * 60 * 1000); 
 
     const { data: logs, error } = await supabase
@@ -118,79 +160,85 @@ const gerarResumoAlertas = async () => {
         .eq('processed', false)
         .gte('created_at', janelaTempo.toISOString());
 
-    if (error) {
-        console.error('❌ Erro ao buscar logs:', error.message);
-        return;
-    }
+    if (error || !logs || logs.length === 0) return;
 
-    if (!logs || logs.length === 0) return; // Silencioso se não houver nada
-
-    let contagemTemp = 0;
-    let contagemHum = 0;
-    let contagemBatt = 0;
-    const detalheSensores = {};
+    // 1. Agrupamento e Estatísticas
+    const grupos = { LEVE: [], MEDIA: [], URGENTE: [] };
+    let totalTemp = 0, totalHum = 0, totalBatt = 0;
 
     logs.forEach(log => {
-        const mac = log.sensor_mac;
-        if (!detalheSensores[mac]) {
-            detalheSensores[mac] = {
-                name: log.display_name || mac,
-                tempVals: [], humVals: [], battVals: [], limits: {}
-            };
-        }
+        // Stats
+        if (log.alert_type.includes('Temperatura')) totalTemp++;
+        else if (log.alert_type.includes('Umidade')) totalHum++;
+        else if (log.alert_type.includes('Bateria')) totalBatt++;
 
-        if (log.alert_type === 'Temperatura') {
-            contagemTemp++;
-            detalheSensores[mac].tempVals.push(log.read_value);
-            detalheSensores[mac].limits.temp = log.limit_value;
-        } 
-        else if (log.alert_type === 'Umidade') {
-            contagemHum++;
-            detalheSensores[mac].humVals.push(log.read_value);
-            detalheSensores[mac].limits.hum = log.limit_value;
-        } 
-        else if (log.alert_type === 'Bateria') {
-            contagemBatt++;
-            detalheSensores[mac].battVals.push(log.read_value);
-            detalheSensores[mac].limits.batt = log.limit_value;
-        }
+        // Categorização
+        let severidade = 'LEVE';
+        if (log.alert_type.includes('[URGENTE]')) severidade = 'URGENTE';
+        else if (log.alert_type.includes('[MEDIA]')) severidade = 'MEDIA';
+        
+        // Estrutura Limpa
+        grupos[severidade].push({
+            sensor: log.display_name || log.sensor_mac,
+            mac: log.sensor_mac,
+            problema: log.alert_type.split(' [')[0], // Remove a tag [MEDIA]
+            valor_lido: Number(log.read_value),
+            valor_limite: Number(log.limit_value),
+            horario: log.created_at
+        });
     });
 
-    let textoDetalhesSensores = "";
-    Object.values(detalheSensores).forEach(sensor => {
-        textoDetalhesSensores += `   🔸 ${sensor.name}:\n`;
-        if (sensor.tempVals.length > 0) textoDetalhesSensores += `      🔥 Temp: atingiu ${Math.max(...sensor.tempVals)}°C (Limite: ${sensor.limits.temp})\n`;
-        if (sensor.humVals.length > 0) textoDetalhesSensores += `      💧 Umid: atingiu ${Math.max(...sensor.humVals)}% (Limite: ${sensor.limits.hum})\n`;
-        if (sensor.battVals.length > 0) textoDetalhesSensores += `      🪫 Batt: caiu para ${Math.min(...sensor.battVals)}% (Alerta em: ${sensor.limits.batt})\n`;
-    });
+    // 2. Definição de Estratégias (Flags para o n8n rotear)
+    const strategies = {
+        urgente: {
+            has_alerts: grupos.URGENTE.length > 0,
+            count: grupos.URGENTE.length,
+            suggested_channel: "LIGACAO_VOZ"
+        },
+        media: {
+            has_alerts: grupos.MEDIA.length > 0,
+            count: grupos.MEDIA.length,
+            suggested_channel: "WHATSAPP"
+        },
+        leve: {
+            has_alerts: grupos.LEVE.length > 0,
+            count: grupos.LEVE.length,
+            suggested_channel: "LOG_OU_WHATSAPP"
+        }
+    };
 
-    const header = `🚨 RELATÓRIO DE ALERTAS CRÍTICOS 🚨`;
-    const resumoNumerico = `
-📊 Novos Incidentes:
-   🔥 Temp: ${contagemTemp} | 💧 Umid: ${contagemHum} | 🪫 Batt: ${contagemBatt}
-   🔴 Total: ${logs.length}`;
-    
-    const secaoDetalhes = `\n📍 Detalhamento:\n${textoDetalhesSensores}`;
-    const mensagemFinal = `${header}\n${resumoNumerico}\n${secaoDetalhes}`;
+    // 3. Montagem do Payload Final
+    const payloadN8N = {
+        meta: {
+            timestamp: agora.toISOString(),
+            source: "Alcateia IoT Backend",
+            total_alerts: logs.length
+        },
+        strategies: strategies,
+        stats: {
+            temp_count: totalTemp,
+            hum_count: totalHum,
+            batt_count: totalBatt
+        },
+        details: {
+            urgente: grupos.URGENTE,
+            media: grupos.MEDIA,
+            leve: grupos.LEVE
+        }
+    };
 
-    client.publish(TOPIC_ALERTS, mensagemFinal, { qos: 1, retain: false });
+    // 4. Publica e Atualiza
+    client.publish(TOPIC_ALERTS, JSON.stringify(payloadN8N), { qos: 1, retain: false });
+    console.log(`📢 JSON enviado para ${TOPIC_ALERTS} (Total: ${logs.length})`);
 
-    // Atualiza status para processado
-    const idsParaAtualizar = logs.map(log => log.id);
-    const { error: errUpdate } = await supabase
-        .from('critical_logs')
-        .update({ processed: true })
-        .in('id', idsParaAtualizar);
-
-    if (errUpdate) console.error('❌ Erro update logs:', errUpdate.message);
+    const ids = logs.map(l => l.id);
+    await supabase.from('critical_logs').update({ processed: true }).in('id', ids);
 };
 
-// --- AGENDAMENTO CRON (A CADA 1 MINUTO) ---
-cron.schedule('*/1 * * * *', () => {
-    gerarResumoAlertas();
-});
+// Cron a cada 1 min
+cron.schedule('*/1 * * * *', () => gerarResumoAlertas());
 
-// --- MQTT ---
+// MQTT Listen
 client.on('connect', () => {
     console.log('✅ Conectado ao MQTT!');
     client.subscribe(TOPIC_DATA);
@@ -198,66 +246,43 @@ client.on('connect', () => {
 
 client.on('message', async (topic, message) => {
     try {
-        const msgString = message.toString();
-        let payload = JSON.parse(msgString);
-        let leiturasParaSalvar = [];
+        const payload = JSON.parse(message.toString());
+        let leituras = [];
 
-        if (payload.gw && payload.mac && payload.ts) {
-            leiturasParaSalvar.push({
-                gw: formatarMac(payload.gw),
-                mac: formatarMac(payload.mac),
-                rssi: payload.rssi,
-                ts: payload.ts,
-                batt: payload.batt,
-                temp: payload.temp,
-                hum: payload.hum
+        if (payload.gw) {
+            leituras.push({ 
+                gw: formatarMac(payload.gw), mac: formatarMac(payload.mac), 
+                ts: payload.ts, batt: payload.batt, 
+                temp: payload.temp, hum: payload.hum, rssi: payload.rssi 
             });
         } else {
-             while (Array.isArray(payload) && payload.length > 0 && Array.isArray(payload[0])) {
-                payload = payload.flat();
-            }
-            const gateways = Array.isArray(payload) ? payload : [payload];
-            gateways.forEach(gatewayMsg => {
-                const gatewayMac = gatewayMsg.gmac;
-                if (gatewayMac && gatewayMsg.obj && Array.isArray(gatewayMsg.obj)) {
-                    gatewayMsg.obj.forEach(sensor => {
-                        if (sensor.type === 1) {
-                            leiturasParaSalvar.push({
-                                gw: formatarMac(gatewayMac),
-                                mac: formatarMac(sensor.dmac),
-                                rssi: sensor.rssi,
-                                ts: sensor.time ? sensor.time.replace(' ', 'T') : new Date().toISOString(),
-                                batt: calcularBateria(sensor.vbatt),
-                                temp: sensor.temp,
-                                hum: sensor.humidity
-                            });
-                        }
+            // Suporte legado
+            const raw = Array.isArray(payload) ? payload.flat(Infinity) : [payload];
+            raw.forEach(gw => {
+                if (gw.obj) gw.obj.filter(s => s.type === 1).forEach(s => {
+                    leituras.push({
+                        gw: formatarMac(gw.gmac),
+                        mac: formatarMac(s.dmac),
+                        ts: s.time ? s.time.replace(' ', 'T') : new Date().toISOString(),
+                        batt: calcularBateria(s.vbatt),
+                        temp: s.temp, hum: s.humidity, rssi: s.rssi
                     });
-                }
+                });
             });
         }
 
-        if (leiturasParaSalvar.length > 0) {
-            // Processa alertas primeiro (com verificação de duplicidade)
-            await processarAlertas(leiturasParaSalvar);
-            
-            // Salva log de telemetria geral
-            const { error } = await supabase.from('telemetry_logs').insert(leiturasParaSalvar);
-            if (error) console.error('❌ Erro Supabase:', error.message);
+        if (leituras.length > 0) {
+            await processarAlertas(leituras);
+            await supabase.from('telemetry_logs').insert(leituras);
         }
     } catch (e) {
-        console.error('❌ Erro crítico:', e.message);
+        console.error('Erro msg:', e.message);
     }
 });
 
 app.get('/api/telemetry/latest', async (req, res) => {
-    try {
-        const { data, error } = await supabase.from('last_sensor_readings').select('*');
-        if (error) throw error;
-        res.status(200).json(data);
-    } catch (error) {
-        res.status(500).json({ error: 'Erro ao buscar dados' });
-    }
+    const { data } = await supabase.from('last_sensor_readings').select('*');
+    res.json(data);
 });
 
-app.listen(PORT, () => console.log(`🚀 API rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 API: ${PORT}`));

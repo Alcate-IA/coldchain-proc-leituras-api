@@ -206,8 +206,8 @@ const gerarResumoAlertas = async () => {
     await supabase.from('critical_logs').update({ processed: true }).in('id', ids);
 };
 
-// Cron a cada 1 min
-cron.schedule('*/1 * * * *', () => gerarResumoAlertas());
+// Cron a cada 30 min
+cron.schedule('*/30 * * * *', () => gerarResumoAlertas());
 
 // MQTT Listen
 client.on('connect', () => {

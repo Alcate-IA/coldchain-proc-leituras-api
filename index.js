@@ -7,16 +7,23 @@ import cron from 'node-cron';
 
 dotenv.config();
 
-// --- CONFIGURAÇÕES ---
-const PORT = process.env.PORT || 3000;
+// --- CONFIGURAÇÕES GERAIS ---
+const PORT = process.env.PORT || 3030;
 const BROKER_URL = 'mqtt://broker.hivemq.com';
 
-// TÓPICOS
-const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';
-const TOPIC_ALERTS = '/alcateia/alerts/summary';
-const TOPIC_GPS = '/alcateia/gateways/beacons/movel/prd_ble_data';
+// --- FEATURE FLAGS (CONTROLE DE TÓPICOS) ---
+const ENABLE_LEGACY_DATA = process.env.ENABLE_LEGACY_DATA === 'true'; 
+const ENABLE_GPS_DATA    = process.env.ENABLE_GPS_DATA === 'true';    
+const ENABLE_DOORS       = process.env.ENABLE_DOORS === 'true';       // Sensores de Porta
+const ENABLE_ALERTS      = process.env.ENABLE_ALERTS === 'true';      // Publicação de Resumo
 
-// Tolerâncias para evitar ruído
+// --- DEFINIÇÃO DE TÓPICOS ---
+const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';        // Legado
+const TOPIC_GPS  = '/alcateia/gateways/beacons/movel/prd_ble_data'; // Novo (GPS)
+const TOPIC_DOORS = '/alcateia/gateways/porta';                     // Portas
+const TOPIC_ALERTS = '/alcateia/alerts/summary';                    // Saída (Alertas)
+
+// Tolerâncias para evitar ruído nos alertas de telemetria
 const TOLERANCIA_TEMP = 0.5;
 const TOLERANCIA_HUM = 2.0;
 
@@ -44,7 +51,7 @@ const calcularBateria = (mVolts) => {
     return Math.round(((mVolts - MIN_MV) / (MAX_MV - MIN_MV)) * 100);
 };
 
-// Classificação de Severidade (Manteve-se igual)
+// --- LOGICA DE ALERTAS (TELEMETRIA) ---
 const classificarSeveridade = (tipo, valor, limite) => {
     let delta = 0;
     if (tipo === 'Temperatura') {
@@ -70,7 +77,6 @@ const classificarSeveridade = (tipo, valor, limite) => {
     return 'LEVE';
 };
 
-// --- FUNÇÃO: PROCESSAR E SALVAR NO BANCO ---
 const processarAlertas = async (leituras) => {
     if (leituras.length === 0) return;
     
@@ -149,9 +155,13 @@ const processarAlertas = async (leituras) => {
     }
 };
 
-// --- FUNÇÃO: GERAR JSON ESTRUTURADO PARA AUTOMAÇÃO ---
+// --- CRON JOB: RESUMO JSON ---
 const gerarResumoAlertas = async () => {
-    // ... (Código do cron mantido igual ao original)
+    if (!ENABLE_ALERTS) {
+        console.log('⏹️ [FLAG OFF] Ciclo de alertas ignorado (Envio desativado).');
+        return; 
+    }
+
     console.log('📅 Gerando payload JSON estruturado...');
     const agora = new Date();
     const janelaTempo = new Date(agora.getTime() - 40 * 60 * 1000); 
@@ -206,36 +216,102 @@ const gerarResumoAlertas = async () => {
     await supabase.from('critical_logs').update({ processed: true }).in('id', ids);
 };
 
-// Cron a cada 30 min
 cron.schedule('*/30 * * * *', () => gerarResumoAlertas());
 
-// MQTT Listen
+// --- EVENTOS MQTT ---
+
 client.on('connect', () => {
-    console.log('✅ Conectado ao MQTT!');
-    // Agora assinamos o tópico antigo E o novo tópico de GPS
-    client.subscribe([TOPIC_DATA, TOPIC_GPS]);
+    console.log('✅ Conectado ao Broker MQTT!');
+    
+    const topicsToSubscribe = [];
+
+    // --- ASSINATURAS BASEADAS NAS FLAGS ---
+    if (ENABLE_LEGACY_DATA) {
+        topicsToSubscribe.push(TOPIC_DATA);
+        console.log(`📡 [FLAG ON] Assinando Legado: ${TOPIC_DATA}`);
+    }
+
+    if (ENABLE_GPS_DATA) {
+        topicsToSubscribe.push(TOPIC_GPS);
+        console.log(`📡 [FLAG ON] Assinando GPS: ${TOPIC_GPS}`);
+    }
+
+    if (ENABLE_DOORS) {
+        topicsToSubscribe.push(TOPIC_DOORS);
+        console.log(`🚪 [FLAG ON] Assinando Portas: ${TOPIC_DOORS}`);
+    }
+
+    if (ENABLE_ALERTS) console.log(`🔔 [FLAG ON] Alertas ativos.`);
+    else console.log(`🔕 [FLAG OFF] Alertas pausados.`);
+
+    if (topicsToSubscribe.length > 0) {
+        client.subscribe(topicsToSubscribe, (err) => {
+            if (!err) console.log(`🚀 Assinando ${topicsToSubscribe.length} tópico(s).`);
+            else console.error('❌ Erro subscribe:', err);
+        });
+    } else {
+        console.warn('⚠️ AVISO: Nenhum tópico habilitado.');
+    }
 });
 
 client.on('message', async (topic, message) => {
     try {
         const payload = JSON.parse(message.toString());
+        
+        // =========================================================
+        // 1. PROCESSAMENTO DE PORTAS (TOPIC_DOORS)
+        // =========================================================
+        if (topic === TOPIC_DOORS) {
+            const doorReadings = [];
+            const gwMac = formatarMac(payload.gmac);
+
+            if (payload.obj) {
+                payload.obj.forEach(s => {
+                    const batteryPct = calcularBateria(s.vbatt);
+                    const alarmCode = s.alarm || 0; 
+                    const isOpen = alarmCode > 0;   // 0=Fechado, >0=Aberto
+
+                    // ATUALIZADO: Sem colunas 'alerts' e 'sensor_vinculado'
+                    doorReadings.push({
+                        gateway_mac: gwMac,
+                        sensor_mac: formatarMac(s.dmac),
+                        timestamp_read: s.time ? s.time.replace(' ', 'T') : new Date().toISOString(),
+                        battery_percent: batteryPct,
+                        rssi: s.rssi,
+                        temp: s.temp,
+                        alarm_code: alarmCode,
+                        is_open: isOpen
+                    });
+                });
+            }
+
+            if (doorReadings.length > 0) {
+                const { error } = await supabase.from('door_logs').insert(doorReadings);
+                if (error) console.error('❌ Erro Supabase (Portas):', error.message);
+               
+            }
+            return; // Impede que o código de telemetria rode para portas
+        }
+
+        // =========================================================
+        // 2. PROCESSAMENTO DE TELEMETRIA (TEMP/HUM/GPS)
+        // =========================================================
         let leituras = [];
 
-        // Verifica se é o formato simplificado antigo
+        // Tratamento Legado
         if (payload.gw && !payload.obj) {
             leituras.push({ 
                 gw: formatarMac(payload.gw), mac: formatarMac(payload.mac), 
                 ts: payload.ts, batt: payload.batt, 
                 temp: payload.temp, hum: payload.hum, rssi: payload.rssi,
-                latitude: null, longitude: null, altitude: null // Default null para formato antigo
+                latitude: null, longitude: null, altitude: null
             });
-        } else {
-            // Lógica Unificada (Suporta o legado e o novo formato com 'location')
-            // O novo formato chega como objeto único, então transformamos em array para usar o mesmo loop
+        } 
+        // Tratamento Unificado (Array/GPS)
+        else {
             const raw = Array.isArray(payload) ? payload.flat(Infinity) : [payload];
             
             raw.forEach(gw => {
-                // Extração dos dados de GPS (se existirem no gateway)
                 let lat = null, lon = null, alt = null;
                 if (gw.location && gw.location.err === 0) {
                     lat = gw.location.latitude;
@@ -243,20 +319,16 @@ client.on('message', async (topic, message) => {
                     alt = gw.location.altitude;
                 }
 
-                // Processa a lista de objetos (sensores)
                 if (gw.obj) {
-                    // O filtro type === 1 remove automaticamente o type 128 e outros
                     gw.obj.filter(s => s.type === 1).forEach(s => {
                         leituras.push({
                             gw: formatarMac(gw.gmac),
                             mac: formatarMac(s.dmac),
-                            // Usa o timestamp do sensor ou do gateway (gw.location.time) ou atual
-                            ts: s.time ? s.time.replace(' ', 'T') : new Date().toISOString(),
-                            batt: calcularBateria(s.vbatt), // Converte mV para %
+                            ts: s.time ? s.time.replace(' ', 'T') : (gw.location?.time || new Date().toISOString()),
+                            batt: calcularBateria(s.vbatt),
                             temp: s.temp, 
                             hum: s.humidity, 
                             rssi: s.rssi,
-                            // Novos campos de GPS
                             latitude: lat,
                             longitude: lon,
                             altitude: alt
@@ -268,17 +340,13 @@ client.on('message', async (topic, message) => {
 
         if (leituras.length > 0) {
             await processarAlertas(leituras);
-            // O Supabase irá inserir latitude/longitude/altitude automaticamente se colunas existirem
             await supabase.from('telemetry_logs').insert(leituras);
         }
     } catch (e) {
-        console.error('Erro msg:', e.message);
+        console.error('❌ Erro msg:', e.message);
     }
 });
 
-app.get('/api/telemetry/latest', async (req, res) => {
-    const { data } = await supabase.from('last_sensor_readings').select('*');
-    res.json(data);
-});
 
-app.listen(PORT, () => console.log(`🚀 API: ${PORT}`));
+
+app.listen(PORT, () => console.log(`🚀 API rodando na porta ${PORT}`));

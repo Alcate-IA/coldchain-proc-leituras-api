@@ -117,12 +117,26 @@ cron.schedule('*/30 * * * *', async () => {
     if (!ENABLE_ALERTS) return;
     logger.info('📅 Gerando resumo de alertas para N8N...');
     // Lógica de consulta e envio MQTT (TOPIC_ALERTS)...
+    // (Pode reinserir a lógica completa de envio aqui se necessário, mantive simplificado como no seu exemplo)
 });
 
 // --- PROCESSAMENTO MQTT ---
-client.on('connect', () => logger.info(`✅ MQTT Conectado. Assinando ${TOPIC_DATA}`));
+
+client.on('connect', () => {
+    logger.info('✅ Conectado ao Broker MQTT!');
+    
+    // CORREÇÃO: Inscrição explícita no tópico
+    client.subscribe(TOPIC_DATA, (err) => {
+        if (!err) {
+            logger.info(`📡 Inscrito com sucesso no tópico: ${TOPIC_DATA}`);
+        } else {
+            logger.error(`❌ Erro ao se inscrever no tópico: ${err.message}`);
+        }
+    });
+});
 
 client.on('message', async (topic, message) => {
+    // Garante que só processa o tópico correto
     if (topic !== TOPIC_DATA) return;
 
     try {
@@ -133,6 +147,7 @@ client.on('message', async (topic, message) => {
         const now = Date.now();
 
         items.forEach((item) => {
+            // Verifica se tem objeto de sensores (formato unificado/GPS)
             if (item.obj && Array.isArray(item.obj)) {
                 const gwMac = formatarMac(item.gmac);
                 
@@ -143,13 +158,18 @@ client.on('message', async (topic, message) => {
                     const timeDiff = now - last.ts;
 
                     // 1. FILTRO DE PORTAS
+                    // Identifica se é sensor de porta pela presença da chave 'alarm'
                     if (PROCESS_DOORS && sensor.alarm !== undefined) {
                         const isOpen = sensor.alarm > 0;
+                        // Debounce: Só salva se mudou estado ou passou X segundos
                         if (isOpen !== last.state || timeDiff > DOOR_DEBOUNCE_MS) {
                             batchPortas.push({
-                                gateway_mac: gwMac, sensor_mac: sensorMac,
+                                gateway_mac: gwMac, 
+                                sensor_mac: sensorMac,
                                 timestamp_read: new Date().toISOString(),
-                                battery_percent: vbatt, is_open: isOpen, alarm_code: sensor.alarm,
+                                battery_percent: vbatt, 
+                                is_open: isOpen, 
+                                alarm_code: sensor.alarm,
                                 rssi: sensor.rssi
                             });
                             lastReadings.set(sensorMac, { ...last, state: isOpen, ts: now });
@@ -157,14 +177,20 @@ client.on('message', async (topic, message) => {
                     } 
                     
                     // 2. FILTRO DE TELEMETRIA (Deadband: 0.5°C / 1%)
+                    // Identifica se é telemetria pela presença de 'temp'
                     else if (PROCESS_GPS && (sensor.temp !== undefined)) {
                         const diffTemp = Math.abs(sensor.temp - last.temp);
                         const diffHum = Math.abs((sensor.humidity || 0) - last.hum);
 
+                        // Só salva se variou muito (deadband) ou se faz muito tempo (heartbeat)
                         if (diffTemp >= VAR_TEMP_MIN || diffHum >= VAR_HUM_MIN || timeDiff > ANALOG_MAX_AGE_MS) {
                             batchTelemetria.push({
-                                gw: gwMac, mac: sensorMac, ts: new Date().toISOString(),
-                                batt: vbatt, temp: sensor.temp, hum: sensor.humidity,
+                                gw: gwMac, 
+                                mac: sensorMac, 
+                                ts: new Date().toISOString(),
+                                batt: vbatt, 
+                                temp: sensor.temp, 
+                                hum: sensor.humidity,
                                 rssi: sensor.rssi,
                                 latitude: (item.location?.err === 0) ? item.location.latitude : null,
                                 longitude: (item.location?.err === 0) ? item.location.longitude : null
@@ -176,20 +202,23 @@ client.on('message', async (topic, message) => {
             }
         });
 
-        // Gravação no Banco
+        // Gravação no Banco Supabase
         if (batchPortas.length > 0) {
             const { error } = await supabase.from('door_logs').insert(batchPortas);
             if (!error) logger.info(`🚪 ${batchPortas.length} logs de porta salvos.`);
+            else logger.error(`❌ Erro Supabase Porta: ${error.message}`);
         }
 
         if (batchTelemetria.length > 0) {
             if (ENABLE_ALERTS) await processarAlertas(batchTelemetria);
+            
             const { error } = await supabase.from('telemetry_logs').insert(batchTelemetria);
             if (!error) logger.info(`🌡️ ${batchTelemetria.length} logs de telemetria salvos.`);
+            else logger.error(`❌ Erro Supabase Telemetria: ${error.message}`);
         }
 
     } catch (e) {
-        logger.error('❌ Erro no processamento: %s', e.message);
+        logger.error('❌ Erro no processamento da mensagem: %s', e.message);
     }
 });
 

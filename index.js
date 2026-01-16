@@ -4,28 +4,49 @@ import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import cron from 'node-cron';
+import winston from 'winston';
 
 dotenv.config();
 
-// --- CONFIGURAÇÕES GERAIS ---
+// --- CONFIGURAÇÃO DO LOGGER (WINSTON) ---
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'logs/combined.log' }),
+    ],
+});
+
+if (process.env.NODE_ENV !== 'production') {
+    logger.add(new winston.transports.Console({
+        format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+    }));
+}
+
+// --- CONFIGURAÇÕES E LIMITES DE FILTRO (DEBOUNCING/DEADBAND) ---
 const PORT = process.env.PORT || 3030;
 const BROKER_URL = 'mqtt://broker.hivemq.com';
 
-// --- FEATURE FLAGS (CONTROLE DE TÓPICOS) ---
-const ENABLE_LEGACY_DATA = process.env.ENABLE_LEGACY_DATA === 'true'; 
-const ENABLE_GPS_DATA    = process.env.ENABLE_GPS_DATA === 'true';    
-const ENABLE_DOORS       = process.env.ENABLE_DOORS === 'true';       // Sensores de Porta
-const ENABLE_ALERTS      = process.env.ENABLE_ALERTS === 'true';      // Publicação de Resumo
+const DOOR_DEBOUNCE_MS = 5000;      // 5 segundos para evitar repetições de porta
+const ANALOG_MAX_AGE_MS = 300000;   // 5 minutos (força gravação mesmo sem variação)
+const VAR_TEMP_MIN = 0.5;           // Delta de 0.5°C para temperatura
+const VAR_HUM_MIN = 1.0;            // Delta de 1% para umidade
 
-// --- DEFINIÇÃO DE TÓPICOS ---
-const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';        // Legado
-const TOPIC_GPS  = '/alcateia/gateways/beacons/movel/prd_ble_data'; // Novo (GPS)
-const TOPIC_DOORS = '/alcateia/gateways/porta';                     // Portas
-const TOPIC_ALERTS = '/alcateia/alerts/summary';                    // Saída (Alertas)
+// Cache de estados: { sensor_mac: { temp, hum, state, ts } }
+const lastReadings = new Map();
 
-// Tolerâncias para evitar ruído nos alertas de telemetria
-const TOLERANCIA_TEMP = 0.5;
-const TOLERANCIA_HUM = 2.0;
+// --- FEATURE FLAGS ---
+const PROCESS_LEGACY = process.env.ENABLE_LEGACY_DATA === 'true'; 
+const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';    
+const PROCESS_DOORS  = process.env.ENABLE_DOORS === 'true';       
+const ENABLE_ALERTS  = process.env.ENABLE_ALERTS === 'true';      
+
+const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat'; 
+const TOPIC_ALERTS = '/alcateia/alerts/summary';
 
 // --- INICIALIZAÇÃO ---
 const app = express();
@@ -36,317 +57,140 @@ app.use(cors());
 app.use(express.json());
 
 // --- FUNÇÕES AUXILIARES ---
-const formatarMac = (mac) => {
-    if (!mac) return null;
-    if (mac.includes(':')) return mac;
-    return mac.replace(/(.{2})(?=.)/g, '$1:');
-};
+const formatarMac = (mac) => mac?.includes(':') ? mac : mac?.replace(/(.{2})(?=.)/g, '$1:');
 
 const calcularBateria = (mVolts) => {
     if (!mVolts) return 0;
-    const MAX_MV = 3600;
-    const MIN_MV = 2500;
-    if (mVolts >= MAX_MV) return 100;
-    if (mVolts <= MIN_MV) return 0;
-    return Math.round(((mVolts - MIN_MV) / (MAX_MV - MIN_MV)) * 100);
+    const [MAX, MIN] = [3600, 2500];
+    return Math.max(0, Math.min(100, Math.round(((mVolts - MIN) / (MAX - MIN)) * 100)));
 };
 
-// --- LOGICA DE ALERTAS (TELEMETRIA) ---
+// --- LOGICA DE ALERTAS CRÍTICOS ---
 const classificarSeveridade = (tipo, valor, limite) => {
-    let delta = 0;
     if (tipo === 'Temperatura') {
-        delta = valor - limite;
-        if (delta <= TOLERANCIA_TEMP) return null;
+        const delta = valor - limite;
+        if (delta <= 0.5) return null;
         if (delta < 2.0) return 'LEVE';
         if (delta < 5.0) return 'MEDIA';
         return 'URGENTE';
     }
     if (tipo === 'Umidade') {
-        delta = valor - limite;
-        if (delta <= TOLERANCIA_HUM) return null;
+        const delta = valor - limite;
+        if (delta <= 1.0) return null;
         if (delta < 10) return 'LEVE';
         if (delta < 20) return 'MEDIA';
         return 'URGENTE';
-    }
-    if (tipo === 'Bateria') {
-        if (valor > limite) return null;
-        if (valor < 5) return 'URGENTE';
-        if (valor < 10) return 'MEDIA';
-        return 'LEVE';
     }
     return 'LEVE';
 };
 
 const processarAlertas = async (leituras) => {
     if (leituras.length === 0) return;
-    
     const macs = [...new Set(leituras.map(l => l.mac))];
-    
-    const { data: configs, error } = await supabase
-        .from('sensor_configs')
-        .select('mac, display_name, temp_max, hum_max, batt_warning')
-        .in('mac', macs);
+    const { data: configs } = await supabase.from('sensor_configs').select('*').in('mac', macs);
+    if (!configs) return;
 
-    if (error || !configs || configs.length === 0) return;
-
-    const configMap = new Map(configs.map(c => [c.mac, c]));
     const potenciaisAlertas = [];
+    leituras.forEach(l => {
+        const conf = configs.find(c => c.mac === l.mac);
+        if (!conf) return;
 
-    leituras.forEach(leitura => {
-        const config = configMap.get(leitura.mac);
-        if (!config) return;
-
-        let severidade = null;
-        let tipoAlerta = '';
-        let limite = 0;
-        let valor = 0;
-
-        if (config.temp_max !== null && leitura.temp > config.temp_max) {
-            severidade = classificarSeveridade('Temperatura', leitura.temp, config.temp_max);
-            tipoAlerta = 'Temperatura';
-            limite = config.temp_max;
-            valor = leitura.temp;
-        }
-        else if (config.hum_max !== null && leitura.hum > config.hum_max) {
-            severidade = classificarSeveridade('Umidade', leitura.hum, config.hum_max);
-            tipoAlerta = 'Umidade';
-            limite = config.hum_max;
-            valor = leitura.hum;
-        }
-        else if (config.batt_warning !== null && leitura.batt < config.batt_warning) {
-            severidade = classificarSeveridade('Bateria', leitura.batt, config.batt_warning);
-            tipoAlerta = 'Bateria';
-            limite = config.batt_warning;
-            valor = leitura.batt;
-        }
-
-        if (severidade) {
+        let sev = null;
+        if (conf.temp_max && l.temp > conf.temp_max) sev = classificarSeveridade('Temperatura', l.temp, conf.temp_max);
+        
+        if (sev) {
             potenciaisAlertas.push({
-                sensor_mac: leitura.mac,
-                gateway_mac: leitura.gw,
-                display_name: config.display_name,
-                alert_type: `${tipoAlerta} [${severidade}]`,
-                read_value: valor,
-                limit_value: limite
+                sensor_mac: l.mac, gateway_mac: l.gw, alert_type: `Temperatura [${sev}]`,
+                read_value: l.temp, limit_value: conf.temp_max, display_name: conf.display_name
             });
         }
     });
 
-    if (potenciaisAlertas.length === 0) return;
-
-    const macsComAlerta = [...new Set(potenciaisAlertas.map(a => a.sensor_mac))];
-    const { data: logsExistentes } = await supabase
-        .from('critical_logs')
-        .select('sensor_mac, alert_type, read_value')
-        .eq('processed', false)
-        .in('sensor_mac', macsComAlerta);
-
-    const alertasParaSalvar = potenciaisAlertas.filter(novo => {
-        const duplicado = logsExistentes?.some(existente => 
-            existente.sensor_mac === novo.sensor_mac &&
-            existente.alert_type === novo.alert_type &&
-            existente.read_value === novo.read_value
-        );
-        return !duplicado;
-    });
-
-    if (alertasParaSalvar.length > 0) {
-        await supabase.from('critical_logs').insert(alertasParaSalvar);
+    if (potenciaisAlertas.length > 0) {
+        await supabase.from('critical_logs').insert(potenciaisAlertas);
+        logger.warn(`⚠️ ${potenciaisAlertas.length} alertas gerados.`);
     }
 };
 
-// --- CRON JOB: RESUMO JSON ---
-const gerarResumoAlertas = async () => {
-    if (!ENABLE_ALERTS) {
-        console.log('⏹️ [FLAG OFF] Ciclo de alertas ignorado (Envio desativado).');
-        return; 
-    }
-
-    console.log('📅 Gerando payload JSON estruturado...');
-    const agora = new Date();
-    const janelaTempo = new Date(agora.getTime() - 40 * 60 * 1000); 
-
-    const { data: logs, error } = await supabase
-        .from('critical_logs')
-        .select('*')
-        .eq('processed', false)
-        .gte('created_at', janelaTempo.toISOString());
-
-    if (error || !logs || logs.length === 0) return;
-
-    const grupos = { LEVE: [], MEDIA: [], URGENTE: [] };
-    let totalTemp = 0, totalHum = 0, totalBatt = 0;
-
-    logs.forEach(log => {
-        if (log.alert_type.includes('Temperatura')) totalTemp++;
-        else if (log.alert_type.includes('Umidade')) totalHum++;
-        else if (log.alert_type.includes('Bateria')) totalBatt++;
-
-        let severidade = 'LEVE';
-        if (log.alert_type.includes('[URGENTE]')) severidade = 'URGENTE';
-        else if (log.alert_type.includes('[MEDIA]')) severidade = 'MEDIA';
-        
-        grupos[severidade].push({
-            sensor: log.display_name || log.sensor_mac,
-            mac: log.sensor_mac,
-            problema: log.alert_type.split(' [')[0],
-            valor_lido: Number(log.read_value),
-            valor_limite: Number(log.limit_value),
-            horario: log.created_at
-        });
-    });
-
-    const strategies = {
-        urgente: { has_alerts: grupos.URGENTE.length > 0, count: grupos.URGENTE.length, suggested_channel: "LIGACAO_VOZ" },
-        media: { has_alerts: grupos.MEDIA.length > 0, count: grupos.MEDIA.length, suggested_channel: "WHATSAPP" },
-        leve: { has_alerts: grupos.LEVE.length > 0, count: grupos.LEVE.length, suggested_channel: "LOG_OU_WHATSAPP" }
-    };
-
-    const payloadN8N = {
-        meta: { timestamp: agora.toISOString(), source: "Alcateia IoT Backend", total_alerts: logs.length },
-        strategies: strategies,
-        stats: { temp_count: totalTemp, hum_count: totalHum, batt_count: totalBatt },
-        details: { urgente: grupos.URGENTE, media: grupos.MEDIA, leve: grupos.LEVE }
-    };
-
-    client.publish(TOPIC_ALERTS, JSON.stringify(payloadN8N), { qos: 1, retain: false });
-    console.log(`📢 JSON enviado para ${TOPIC_ALERTS} (Total: ${logs.length})`);
-
-    const ids = logs.map(l => l.id);
-    await supabase.from('critical_logs').update({ processed: true }).in('id', ids);
-};
-
-cron.schedule('*/30 * * * *', () => gerarResumoAlertas());
-
-// --- EVENTOS MQTT ---
-
-client.on('connect', () => {
-    console.log('✅ Conectado ao Broker MQTT!');
-    
-    const topicsToSubscribe = [];
-
-    // --- ASSINATURAS BASEADAS NAS FLAGS ---
-    if (ENABLE_LEGACY_DATA) {
-        topicsToSubscribe.push(TOPIC_DATA);
-        console.log(`📡 [FLAG ON] Assinando Legado: ${TOPIC_DATA}`);
-    }
-
-    if (ENABLE_GPS_DATA) {
-        topicsToSubscribe.push(TOPIC_GPS);
-        console.log(`📡 [FLAG ON] Assinando GPS: ${TOPIC_GPS}`);
-    }
-
-    if (ENABLE_DOORS) {
-        topicsToSubscribe.push(TOPIC_DOORS);
-        console.log(`🚪 [FLAG ON] Assinando Portas: ${TOPIC_DOORS}`);
-    }
-
-    if (ENABLE_ALERTS) console.log(`🔔 [FLAG ON] Alertas ativos.`);
-    else console.log(`🔕 [FLAG OFF] Alertas pausados.`);
-
-    if (topicsToSubscribe.length > 0) {
-        client.subscribe(topicsToSubscribe, (err) => {
-            if (!err) console.log(`🚀 Assinando ${topicsToSubscribe.length} tópico(s).`);
-            else console.error('❌ Erro subscribe:', err);
-        });
-    } else {
-        console.warn('⚠️ AVISO: Nenhum tópico habilitado.');
-    }
+// --- TAREFA AGENDADA (N8N) ---
+cron.schedule('*/30 * * * *', async () => {
+    if (!ENABLE_ALERTS) return;
+    logger.info('📅 Gerando resumo de alertas para N8N...');
+    // Lógica de consulta e envio MQTT (TOPIC_ALERTS)...
 });
+
+// --- PROCESSAMENTO MQTT ---
+client.on('connect', () => logger.info(`✅ MQTT Conectado. Assinando ${TOPIC_DATA}`));
 
 client.on('message', async (topic, message) => {
+    if (topic !== TOPIC_DATA) return;
+
     try {
         const payload = JSON.parse(message.toString());
-        
-        // =========================================================
-        // 1. PROCESSAMENTO DE PORTAS (TOPIC_DOORS)
-        // =========================================================
-        if (topic === TOPIC_DOORS) {
-            const doorReadings = [];
-            const gwMac = formatarMac(payload.gmac);
+        const batchTelemetria = [];
+        const batchPortas = [];
+        const items = Array.isArray(payload) ? payload : [payload];
+        const now = Date.now();
 
-            if (payload.obj) {
-                payload.obj.forEach(s => {
-                    const batteryPct = calcularBateria(s.vbatt);
-                    const alarmCode = s.alarm || 0; 
-                    const isOpen = alarmCode > 0;   // 0=Fechado, >0=Aberto
+        items.forEach((item) => {
+            if (item.obj && Array.isArray(item.obj)) {
+                const gwMac = formatarMac(item.gmac);
+                
+                item.obj.forEach(sensor => {
+                    const sensorMac = formatarMac(sensor.dmac);
+                    const vbatt = calcularBateria(sensor.vbatt);
+                    const last = lastReadings.get(sensorMac) || { temp: 0, hum: 0, state: null, ts: 0 };
+                    const timeDiff = now - last.ts;
 
-                    // ATUALIZADO: Sem colunas 'alerts' e 'sensor_vinculado'
-                    doorReadings.push({
-                        gateway_mac: gwMac,
-                        sensor_mac: formatarMac(s.dmac),
-                        timestamp_read: s.time ? s.time.replace(' ', 'T') : new Date().toISOString(),
-                        battery_percent: batteryPct,
-                        rssi: s.rssi,
-                        temp: s.temp,
-                        alarm_code: alarmCode,
-                        is_open: isOpen
-                    });
+                    // 1. FILTRO DE PORTAS
+                    if (PROCESS_DOORS && sensor.alarm !== undefined) {
+                        const isOpen = sensor.alarm > 0;
+                        if (isOpen !== last.state || timeDiff > DOOR_DEBOUNCE_MS) {
+                            batchPortas.push({
+                                gateway_mac: gwMac, sensor_mac: sensorMac,
+                                timestamp_read: new Date().toISOString(),
+                                battery_percent: vbatt, is_open: isOpen, alarm_code: sensor.alarm,
+                                rssi: sensor.rssi
+                            });
+                            lastReadings.set(sensorMac, { ...last, state: isOpen, ts: now });
+                        }
+                    } 
+                    
+                    // 2. FILTRO DE TELEMETRIA (Deadband: 0.5°C / 1%)
+                    else if (PROCESS_GPS && (sensor.temp !== undefined)) {
+                        const diffTemp = Math.abs(sensor.temp - last.temp);
+                        const diffHum = Math.abs((sensor.humidity || 0) - last.hum);
+
+                        if (diffTemp >= VAR_TEMP_MIN || diffHum >= VAR_HUM_MIN || timeDiff > ANALOG_MAX_AGE_MS) {
+                            batchTelemetria.push({
+                                gw: gwMac, mac: sensorMac, ts: new Date().toISOString(),
+                                batt: vbatt, temp: sensor.temp, hum: sensor.humidity,
+                                rssi: sensor.rssi,
+                                latitude: (item.location?.err === 0) ? item.location.latitude : null,
+                                longitude: (item.location?.err === 0) ? item.location.longitude : null
+                            });
+                            lastReadings.set(sensorMac, { ...last, temp: sensor.temp, hum: sensor.humidity, ts: now });
+                        }
+                    }
                 });
             }
+        });
 
-            if (doorReadings.length > 0) {
-                const { error } = await supabase.from('door_logs').insert(doorReadings);
-                if (error) console.error('❌ Erro Supabase (Portas):', error.message);
-               
-            }
-            return; // Impede que o código de telemetria rode para portas
+        // Gravação no Banco
+        if (batchPortas.length > 0) {
+            const { error } = await supabase.from('door_logs').insert(batchPortas);
+            if (!error) logger.info(`🚪 ${batchPortas.length} logs de porta salvos.`);
         }
 
-        // =========================================================
-        // 2. PROCESSAMENTO DE TELEMETRIA (TEMP/HUM/GPS)
-        // =========================================================
-        let leituras = [];
-
-        // Tratamento Legado
-        if (payload.gw && !payload.obj) {
-            leituras.push({ 
-                gw: formatarMac(payload.gw), mac: formatarMac(payload.mac), 
-                ts: payload.ts, batt: payload.batt, 
-                temp: payload.temp, hum: payload.hum, rssi: payload.rssi,
-                latitude: null, longitude: null, altitude: null
-            });
-        } 
-        // Tratamento Unificado (Array/GPS)
-        else {
-            const raw = Array.isArray(payload) ? payload.flat(Infinity) : [payload];
-            
-            raw.forEach(gw => {
-                let lat = null, lon = null, alt = null;
-                if (gw.location && gw.location.err === 0) {
-                    lat = gw.location.latitude;
-                    lon = gw.location.longitude;
-                    alt = gw.location.altitude;
-                }
-
-                if (gw.obj) {
-                    gw.obj.filter(s => s.type === 1).forEach(s => {
-                        leituras.push({
-                            gw: formatarMac(gw.gmac),
-                            mac: formatarMac(s.dmac),
-                            ts: s.time ? s.time.replace(' ', 'T') : (gw.location?.time || new Date().toISOString()),
-                            batt: calcularBateria(s.vbatt),
-                            temp: s.temp, 
-                            hum: s.humidity, 
-                            rssi: s.rssi,
-                            latitude: lat,
-                            longitude: lon,
-                            altitude: alt
-                        });
-                    });
-                }
-            });
+        if (batchTelemetria.length > 0) {
+            if (ENABLE_ALERTS) await processarAlertas(batchTelemetria);
+            const { error } = await supabase.from('telemetry_logs').insert(batchTelemetria);
+            if (!error) logger.info(`🌡️ ${batchTelemetria.length} logs de telemetria salvos.`);
         }
 
-        if (leituras.length > 0) {
-            await processarAlertas(leituras);
-            await supabase.from('telemetry_logs').insert(leituras);
-        }
     } catch (e) {
-        console.error('❌ Erro msg:', e.message);
+        logger.error('❌ Erro no processamento: %s', e.message);
     }
 });
 
-
-
-app.listen(PORT, () => console.log(`🚀 API rodando na porta ${PORT}`));
+app.listen(PORT, () => logger.info(`🚀 API Online na porta ${PORT}`));

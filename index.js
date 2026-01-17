@@ -135,6 +135,115 @@ client.on('connect', () => {
     });
 });
 
+// --- ROTINA: RELATÓRIO PARA AGENTE DE VOZ (VIA N8N) ---
+const processarRelatorioVoz = async () => {
+    logger.info('🗣️ Verificando dados para o Agente de Voz...');
+
+    // 2. Busca configs e dados (Mesma lógica anterior)
+    const { data: configs } = await supabase.from('sensor_configs').select('*');
+    if (!configs || configs.length === 0) return;
+
+    // Busca logs recentes
+    const { data: logs } = await supabase
+        .from('telemetry_logs')
+        .select('mac, temp, hum, ts')
+        .order('ts', { ascending: false })
+        .limit(2000);
+
+    if (!logs) return;
+
+    // 3. Deduplicação (Última leitura por MAC)
+    const ultimasLeituras = new Map();
+    logs.forEach(log => {
+        if (!ultimasLeituras.has(log.mac)) ultimasLeituras.set(log.mac, log);
+    });
+
+    // 4. Construção da Narrativa (Texto para Fala)
+    let frasesDeAlerta = [];
+    let detalhesTecnicos = []; // Para enviar no JSON caso queira mandar WhatsApp também
+
+    configs.forEach(config => {
+        const leitura = ultimasLeituras.get(config.mac);
+        if (!leitura) return;
+
+        // Limpa o nome para ficar audível (Ex: "Sensor_01" vira "Sensor 0 1")
+        const nomeFalado = (config.display_name || "Sensor desconhecido").replace(/_/g, " ");
+        let problemasSensor = [];
+
+        // Verifica Temperatura
+        if (config.temp_max !== null && leitura.temp > config.temp_max) {
+            // Arredonda para 1 casa decimal para o robô não falar "vinte ponto cinco quatro três"
+            const valor = leitura.temp.toFixed(1).replace('.', ','); 
+            problemasSensor.push(`temperatura alta de ${valor} graus`);
+        }
+
+        // Verifica Umidade
+        if (config.hum_max !== null && leitura.hum > config.hum_max) {
+            const valor = leitura.hum.toFixed(0); // Umidade geralmente não precisa de decimal na fala
+            problemasSensor.push(`umidade alta de ${valor} por cento`);
+        }
+
+        // Se detectou problema neste sensor, monta a frase dele
+        if (problemasSensor.length > 0) {
+            // Ex: "No Estoque Seco, foi detectado temperatura alta de 30 graus e umidade alta de 80 por cento."
+            frasesDeAlerta.push(`No ${nomeFalado}, foi detectado ${problemasSensor.join(' e ')}.`);
+            
+            detalhesTecnicos.push({
+                sensor: config.display_name,
+                temp: leitura.temp,
+                hum: leitura.hum,
+                limite_temp: config.temp_max
+            });
+        }
+    });
+
+    // 5. Lógica de Disparo (FLAG DE CONTROLE)
+    const temAlertas = frasesDeAlerta.length > 0;
+
+    if (!temAlertas) {
+        logger.info('✅ Nenhum alerta crítico. Automação de voz não será chamada.');
+        return; // <--- AQUI ESTÁ A FLAG: Encerra a função se não tiver alertas.
+    }
+
+    // 6. Montagem da Mensagem Final para o Agente
+    // Intro amigável + Junção das frases
+    const saudacao = "Olá, aqui é o monitoramento da Alcateia. Temos alertas críticos precisando de atenção.";
+    const corpoMensagem = frasesDeAlerta.join(' Além disso, '); // Conector natural
+    const conclusao = "Por favor, verifique o painel imediatamente.";
+    
+    const textoCompletoTTS = `${saudacao} ${corpoMensagem} ${conclusao}`;
+
+    // 7. Payload para o n8n
+    const payload = {
+        trigger_reason: "critical_report_voice",
+        has_alerts: true, // Flag explicita no JSON
+        timestamp: new Date().toISOString(),
+        tts_message: textoCompletoTTS, // O texto pronto para o ElevenLabs/Twilio/OpenAI ler
+        alert_count: frasesDeAlerta.length,
+        raw_data: detalhesTecnicos // Dados brutos caso o agente precise consultar
+    };
+
+    // 8. Envio para o n8n
+    try {
+        logger.info(`📞 Enviando alerta de voz com ${frasesDeAlerta.length} ocorrências para o n8n...`);
+        
+        const response = await fetch('https://n8n.alcateia-ia.com/webhook-test/alertas', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (response.ok) logger.info('✅ Webhook de voz acionado com sucesso.');
+        else logger.error(`❌ Erro no Webhook n8n: ${response.statusText}`);
+
+    } catch (error) {
+        logger.error(`❌ Falha na conexão com n8n: ${error.message}`);
+    }
+};
+
+// Agendamento: A cada 30 minutos (ou ajuste conforme necessidade)
+cron.schedule('*/1000 * * * *', () => processarRelatorioVoz());
+
 client.on('message', async (topic, message) => {
     // Garante que só processa o tópico correto
     if (topic !== TOPIC_DATA) return;

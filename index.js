@@ -11,7 +11,7 @@ dotenv.config();
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
-        winston.format.timestamp({ format: 'HH:mm:ss' }), // Simplifiquei para ficar mais limpo no console
+        winston.format.timestamp({ format: 'HH:mm:ss' }),
         winston.format.printf(({ timestamp, level, message }) => {
             return `[${timestamp}] ${level.toUpperCase()}: ${message}`;
         })
@@ -95,6 +95,13 @@ const atualizarCacheConfiguracoes = async () => {
     }
 };
 
+// Rota para Refresh Manual
+app.all('/api/refresh-config', async (req, res) => {
+    logger.info('🔄 [API] Solicitação manual de atualização de cache recebida.');
+    await atualizarCacheConfiguracoes();
+    res.json({ success: true, message: 'Cache atualizado.', sensores_ativos: configCache.size });
+});
+
 setTimeout(atualizarCacheConfiguracoes, 1000);
 setInterval(atualizarCacheConfiguracoes, 10 * 60 * 1000);
 
@@ -109,14 +116,14 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
     // 1. Temperatura
     if (leituraAtual.temp !== undefined && config.temp_max !== null) {
         if (leituraAtual.temp > config.temp_max) {
-            falhas.push(`temperatura alta (${leituraAtual.temp.toFixed(1)}°C)`);
+            falhas.push(`temperatura alta de ${leituraAtual.temp.toFixed(1)} graus`);
         }
     }
 
     // 2. Umidade
     if (leituraAtual.humidity !== undefined && config.hum_max !== null) {
         if (leituraAtual.humidity > config.hum_max) {
-            falhas.push(`umidade alta (${leituraAtual.humidity.toFixed(0)}%)`);
+            falhas.push(`umidade alta de ${leituraAtual.humidity.toFixed(0)} por cento`);
         }
     }
 
@@ -128,7 +135,7 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
             const tempoAberto = Date.now() - estadoMemoria.open_since;
             if (tempoAberto > DOOR_TIME_LIMIT) {
                 const minutos = Math.floor(tempoAberto / 60000);
-                falhas.push(`porta aberta há ${minutos} min`);
+                falhas.push(`porta aberta há ${minutos} minutos`);
             }
         } else {
             estadoMemoria.open_since = null;
@@ -145,19 +152,18 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
 
     alertControl.set(sensorMac, { last_alert_ts: now });
 
+    // RETORNA DADOS NECESSÁRIOS PARA O PAYLOAD
     return {
-        sensor_mac: sensorMac,
         sensor_nome: nome,
-        descricao_problemas: falhas,
-        leitura_atual: {
+        descricao_problemas: falhas, // Array de strings formatadas para voz
+        
+        // Dados crus para raw_data
+        dados_brutos: {
+            sensor: nome,
             temp: leituraAtual.temp,
             hum: leituraAtual.humidity,
-            porta_aberta: leituraAtual.alarm > 0,
-            bateria: calcularBateria(leituraAtual.vbatt)
-        },
-        limites_configurados: {
-            temp_max: config.temp_max,
-            hum_max: config.hum_max
+            limite_temp: config.temp_max,
+            limite_hum: config.hum_max
         }
     };
 };
@@ -181,7 +187,6 @@ client.on('message', async (topic, message) => {
         const items = Array.isArray(payload) ? payload : [payload];
         const now = Date.now();
 
-        // LOG DE ENTRADA (DEBUG VISUAL)
         logger.info(`📥 [MQTT] Recebido pacote com ${items.length} gateway(s).`);
 
         const dbBatchPortas = [];
@@ -243,32 +248,45 @@ client.on('message', async (topic, message) => {
             }
         });
 
-        // --- C. AÇÕES FINAIS ---
+        // --- C. AÇÕES FINAIS (ENVIO N8N FORMATADO) ---
 
-        // 1. Disparo N8N
         if (alertasConsolidados.length > 0) {
             const qtd = alertasConsolidados.length;
-            const nomes = alertasConsolidados.map(a => a.sensor_nome).join(', ');
-            const ttsMessage = `Atenção. ${qtd} ocorrências críticas: ${nomes}.`;
+
+            // 1. Constrói o raw_data (Array Limpo)
+            const rawData = alertasConsolidados.map(a => a.dados_brutos);
+
+            // 2. Constrói a mensagem de voz (TTS)
+            const frasesDetalhadas = alertasConsolidados.map(a => {
+                // "No [Sensor], foi detectado [temp alta] e [porta aberta]"
+                return `No ${a.sensor_nome}, foi detectado ${a.descricao_problemas.join(' e ')}`;
+            });
+
+            const ttsMessage = `Olá, aqui é o monitoramento da Alcateia. Atenção para os seguintes alertas. ${frasesDetalhadas.join('. ')}. Verifique o painel imediatamente.`;
+
+            // 3. Monta o Payload Final
+            const payloadN8N = {
+                trigger_reason: "critical_report_voice",
+                has_alerts: true,
+                timestamp: new Date().toISOString(),
+                tts_message: ttsMessage,
+                alert_count: qtd,
+                raw_data: rawData
+            };
 
             logger.info(`🚨 [N8N] Enviando ${qtd} alertas...`);
 
             fetch('https://n8n.alcateia-ia.com/webhook/coldchain/alertas', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    timestamp: new Date().toISOString(),
-                    qtd_alertas: qtd,
-                    tts_message: ttsMessage,
-                    alertas: alertasConsolidados
-                })
+                body: JSON.stringify(payloadN8N)
             }).catch(err => logger.error(`❌ [N8N] Falha: ${err.message}`));
+
         } else {
-            // LOG STATUS NORMAL
             logger.info(`✅ [STATUS] Processados ${sensoresProcessadosCount} sensores. Nenhum alerta crítico.`);
         }
 
-        // 2. Gravação DB (Com logs de sucesso)
+        // Gravação DB (Mantida igual)
         if (dbBatchPortas.length > 0) {
             supabase.from('door_logs').insert(dbBatchPortas)
                 .then(({ error }) => { 
@@ -294,5 +312,5 @@ client.on('reconnect', () => logger.warn('⚠️ [MQTT] Reconectando...'));
 client.on('offline', () => logger.warn('🔌 [MQTT] Offline.'));
 client.on('error', (err) => logger.error(`🔥 [MQTT] Erro: ${err.message}`));
 
-app.get('/', (req, res) => res.send('Alcateia Gateway Processing Online'));
+// --- INICIALIZAÇÃO DO SERVIDOR EXPRESS ---
 app.listen(PORT, () => logger.info(`🚀 API Online na porta ${PORT}`));

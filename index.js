@@ -163,7 +163,7 @@ const processarRelatorioVoz = async () => {
     try {
         logger.info(`📞 Enviando alerta de voz (${frasesDeAlerta.length} ocorrências) para o N8N...`);
         
-        const response = await fetch('https://n8n.alcateia-ia.com/webhook-test/alertas', {
+        const response = await fetch('https://n8n.alcateia-ia.com/webhook/coldchain/alertas', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)

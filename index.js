@@ -9,6 +9,7 @@ import winston from 'winston';
 dotenv.config();
 
 // --- CONFIGURAÇÃO DO LOGGER (WINSTON) ---
+// Configurado para exibir logs no Console E salvar em arquivo
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
@@ -18,36 +19,48 @@ const logger = winston.createLogger({
     transports: [
         new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
         new winston.transports.File({ filename: 'logs/combined.log' }),
+        // Adicionado Console explicitamente para debug na VPS
+        new winston.transports.Console({
+            format: winston.format.combine(
+                winston.format.colorize(),
+                winston.format.simple()
+            ),
+        })
     ],
 });
 
-    logger.add(new winston.transports.Console({
-        format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
-    }));
-
-// --- CONFIGURAÇÕES E LIMITES DE FILTRO (DEBOUNCING/DEADBAND) ---
+// --- CONSTANTES E CONFIGURAÇÕES ---
 const PORT = process.env.PORT || 3030;
 const BROKER_URL = 'mqtt://broker.hivemq.com';
 
-const DOOR_DEBOUNCE_MS = 5000;      // 5 segundos para evitar repetições de porta
-const ANALOG_MAX_AGE_MS = 300000;   // 5 minutos (força gravação mesmo sem variação)
-const VAR_TEMP_MIN = 0.5;           // Delta de 0.5°C para temperatura
-const VAR_HUM_MIN = 1.0;            // Delta de 1% para umidade
+// Filtros e Deadbands
+const DOOR_DEBOUNCE_MS = 5000;      // 5 segundos para porta
+const ANALOG_MAX_AGE_MS = 300000;   // 5 minutos (heartbeat)
+const VAR_TEMP_MIN = 0.5;           // Variação min de Temperatura
+const VAR_HUM_MIN = 1.0;            // Variação min de Umidade
+
+const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat'; 
+
+// Feature Flags
+const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';    
+const PROCESS_DOORS  = process.env.ENABLE_DOORS === 'true';       
 
 // Cache de estados: { sensor_mac: { temp, hum, state, ts } }
 const lastReadings = new Map();
 
-// --- FEATURE FLAGS ---
-const PROCESS_LEGACY = process.env.ENABLE_LEGACY_DATA === 'true'; 
-const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';    
-const PROCESS_DOORS  = process.env.ENABLE_DOORS === 'true';       
-
-const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat'; 
-
 // --- INICIALIZAÇÃO ---
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const client = mqtt.connect(BROKER_URL);
+
+// ---------------------------------------------------------------------------
+// CORREÇÃO CRÍTICA PARA VPS: CLIENT ID ÚNICO
+// Gera um ID aleatório a cada reinício para evitar conflito com versão local
+// ---------------------------------------------------------------------------
+const client = mqtt.connect(BROKER_URL, {
+    clientId: 'alcateia_vps_' + Math.random().toString(16).substring(2, 10),
+    clean: true,
+    reconnectPeriod: 5000
+});
 
 app.use(cors());
 app.use(express.json());
@@ -61,36 +74,22 @@ const calcularBateria = (mVolts) => {
     return Math.max(0, Math.min(100, Math.round(((mVolts - MIN) / (MAX - MIN)) * 100)));
 };
 
-// --- PROCESSAMENTO MQTT ---
-
-client.on('connect', () => {
-    logger.info('✅ Conectado ao Broker MQTT!');
-    
-    client.subscribe(TOPIC_DATA, (err) => {
-        if (!err) {
-            logger.info(`📡 Inscrito com sucesso no tópico: ${TOPIC_DATA}`);
-        } else {
-            logger.error(`❌ Erro ao se inscrever no tópico: ${err.message}`);
-        }
-    });
-});
-
 // --- ROTINA: RELATÓRIO PARA AGENTE DE VOZ (VIA N8N) ---
 const processarRelatorioVoz = async () => {
-    logger.info('🗣️ Verificando dados para o Agente de Voz...');
+    logger.info('🗣️ Iniciando verificação para Agente de Voz...');
 
-    // Busca configs apenas de sensores ativos (em_manutencao = false)
+    // 1. Busca configurações APENAS de sensores ativos (em_manutencao = false)
     const { data: configs } = await supabase
         .from('sensor_configs')
         .select('*')
         .eq('em_manutencao', false);
 
     if (!configs || configs.length === 0) {
-        // Silencioso se não houver configs, ou loga debug
+        // Se não tiver sensores ativos, não faz nada
         return;
     }
 
-    // Busca logs recentes
+    // 2. Busca logs recentes
     const { data: logs } = await supabase
         .from('telemetry_logs')
         .select('mac, temp, hum, ts')
@@ -99,13 +98,13 @@ const processarRelatorioVoz = async () => {
 
     if (!logs) return;
 
-    // Deduplicação (Última leitura por MAC)
+    // 3. Deduplicação (Última leitura por MAC)
     const ultimasLeituras = new Map();
     logs.forEach(log => {
         if (!ultimasLeituras.has(log.mac)) ultimasLeituras.set(log.mac, log);
     });
 
-    // Construção da Narrativa (Texto para Fala)
+    // 4. Análise de Alertas
     let frasesDeAlerta = [];
     let detalhesTecnicos = []; 
 
@@ -140,13 +139,12 @@ const processarRelatorioVoz = async () => {
         }
     });
 
-    // Lógica de Disparo
+    // 5. Envio (Se houver alertas)
     if (frasesDeAlerta.length === 0) {
-        logger.info('✅ Nenhum alerta crítico encontrado. Automação encerrada.');
+        logger.info('✅ Voz: Tudo normal. Nenhum alerta gerado.');
         return; 
     }
 
-    // Montagem da Mensagem Final
     const saudacao = "Olá, aqui é o monitoramento da Alcateia. Atenção para os seguintes alertas.";
     const corpoMensagem = frasesDeAlerta.join(' Além disso, ');
     const conclusao = "Verifique o painel imediatamente.";
@@ -163,7 +161,7 @@ const processarRelatorioVoz = async () => {
     };
 
     try {
-        logger.info(`📞 Enviando alerta com ${frasesDeAlerta.length} ocorrências para o n8n...`);
+        logger.info(`📞 Enviando alerta de voz (${frasesDeAlerta.length} ocorrências) para o N8N...`);
         
         const response = await fetch('https://n8n.alcateia-ia.com/webhook-test/alertas', {
             method: 'POST',
@@ -171,22 +169,45 @@ const processarRelatorioVoz = async () => {
             body: JSON.stringify(payload)
         });
 
-        if (response.ok) logger.info('✅ Webhook acionado com sucesso.');
-        else logger.error(`❌ Erro no Webhook n8n: ${response.statusText}`);
+        if (response.ok) logger.info('✅ Webhook N8N acionado com sucesso.');
+        else logger.error(`❌ Erro no Webhook N8N: ${response.statusText}`);
 
     } catch (error) {
-        logger.error(`❌ Falha na conexão com n8n: ${error.message}`);
+        logger.error(`❌ Falha na conexão com N8N: ${error.message}`);
     }
 };
 
-// Agendamento do relatório de voz
+// Agenda a rotina de voz para rodar a cada 30 minutos
 cron.schedule('*/30 * * * *', () => processarRelatorioVoz());
 
+// --- EVENTOS MQTT ---
+
+client.on('connect', () => {
+    logger.info(`✅ [MQTT] Conectado! ID: ${client.options.clientId}`);
+    
+    client.subscribe(TOPIC_DATA, (err) => {
+        if (!err) {
+            logger.info(`📡 [MQTT] Inscrito no tópico: ${TOPIC_DATA}`);
+        } else {
+            logger.error(`❌ [MQTT] Erro na inscrição: ${err.message}`);
+        }
+    });
+});
+
+client.on('reconnect', () => logger.warn('⚠️ [MQTT] Tentando reconectar...'));
+client.on('offline', () => logger.warn('🔌 [MQTT] Cliente offline.'));
+client.on('error', (err) => logger.error(`🔥 [MQTT] Erro: ${err.message}`));
+
 client.on('message', async (topic, message) => {
+    // Log de diagnóstico para confirmar recebimento na VPS
+    // logger.info(`📨 Recebido: ${message.length} bytes`); // Descomente se quiser muito detalhe
+
     if (topic !== TOPIC_DATA) return;
 
     try {
-        const payload = JSON.parse(message.toString());
+        const payloadStr = message.toString();
+        const payload = JSON.parse(payloadStr);
+        
         const batchTelemetria = [];
         const batchPortas = [];
         const items = Array.isArray(payload) ? payload : [payload];
@@ -202,7 +223,7 @@ client.on('message', async (topic, message) => {
                     const last = lastReadings.get(sensorMac) || { temp: 0, hum: 0, state: null, ts: 0 };
                     const timeDiff = now - last.ts;
 
-                    // 1. PROCESSAMENTO DE PORTAS
+                    // 1. PORTAS
                     if (PROCESS_DOORS && sensor.alarm !== undefined) {
                         const isOpen = sensor.alarm > 0;
                         if (isOpen !== last.state || timeDiff > DOOR_DEBOUNCE_MS) {
@@ -219,7 +240,7 @@ client.on('message', async (topic, message) => {
                         }
                     } 
                     
-                    // 2. PROCESSAMENTO DE TELEMETRIA
+                    // 2. TELEMETRIA (TEMP/HUM)
                     else if (PROCESS_GPS && (sensor.temp !== undefined)) {
                         const diffTemp = Math.abs(sensor.temp - last.temp);
                         const diffHum = Math.abs((sensor.humidity || 0) - last.hum);
@@ -251,15 +272,13 @@ client.on('message', async (topic, message) => {
         }
 
         if (batchTelemetria.length > 0) {
-            // Removido processarAlertas e insert em critical_logs aqui
-            
             const { error } = await supabase.from('telemetry_logs').insert(batchTelemetria);
             if (!error) logger.info(`🌡️ ${batchTelemetria.length} logs de telemetria salvos.`);
             else logger.error(`❌ Erro Supabase Telemetria: ${error.message}`);
         }
 
     } catch (e) {
-        logger.error('❌ Erro no processamento da mensagem: %s', e.message);
+        logger.error(`❌ Erro no processamento da mensagem: ${e.message}`);
     }
 });
 

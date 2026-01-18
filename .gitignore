@@ -13,4 +13,5 @@ resources/sass/.sass-cache/
 resources/.arch-internal-preview.css
 .arch-internal-preview.css
 node_modules
-logs/*.log
+logs/combined.log
+logs/error.log

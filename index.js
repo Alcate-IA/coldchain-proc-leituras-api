@@ -3,7 +3,6 @@ import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
-import cron from 'node-cron';
 import winston from 'winston';
 
 dotenv.config();
@@ -12,16 +11,20 @@ dotenv.config();
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
-        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-        winston.format.json()
+        winston.format.timestamp({ format: 'HH:mm:ss' }), // Simplifiquei para ficar mais limpo no console
+        winston.format.printf(({ timestamp, level, message }) => {
+            return `[${timestamp}] ${level.toUpperCase()}: ${message}`;
+        })
     ),
     transports: [
-        new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'logs/combined.log' }),
+        new winston.transports.File({ filename: 'logs/error.log', level: 'error', format: winston.format.json() }),
+        new winston.transports.File({ filename: 'logs/combined.log', format: winston.format.json() }),
         new winston.transports.Console({
             format: winston.format.combine(
                 winston.format.colorize(),
-                winston.format.simple()
+                winston.format.printf(({ timestamp, level, message }) => {
+                    return `[${timestamp}] ${level}: ${message}`;
+                })
             ),
         })
     ],
@@ -30,29 +33,31 @@ const logger = winston.createLogger({
 // --- CONSTANTES E CONFIGURAÇÕES ---
 const PORT = process.env.PORT || 3030;
 const BROKER_URL = 'mqtt://broker.hivemq.com';
+const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';
 
-// Filtros e Deadbands para Gravação
-const DOOR_DEBOUNCE_MS = 5000;      // 5 segundos para porta (para gravar no banco)
-const ANALOG_MAX_AGE_MS = 300000;   // 5 minutos (heartbeat gravação)
-const VAR_TEMP_MIN = 0.5;           // Variação min de Temperatura
-const VAR_HUM_MIN = 1.0;            // Variação min de Umidade
+// Filtros de Gravação (DB)
+const DOOR_DEBOUNCE_MS = 5000;      // 5s para gravar alteração de porta
+const ANALOG_MAX_AGE_MS = 300000;   // 5min heartbeat gravação
+const VAR_TEMP_MIN = 0.5;           // Variação min Temp
+const VAR_HUM_MIN = 1.0;            // Variação min Hum
 
-const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat'; 
+// Regras de Alerta (Memória)
+const ALERT_COOLDOWN = 20 * 60 * 1000; // 20 minutos de silêncio para o MESMO sensor
+const DOOR_TIME_LIMIT = 5 * 60 * 1000; // 5 minutos porta aberta para gerar alerta
 
 // Feature Flags
-const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';    
-const PROCESS_DOORS  = process.env.ENABLE_DOORS === 'true';       
+const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';
+const PROCESS_DOORS  = process.env.ENABLE_DOORS === 'true';
 
-// Cache de estados: { sensor_mac: { temp, hum, state, ts } }
+// --- ESTADO EM MEMÓRIA ---
 const lastReadings = new Map();
+const alertControl = new Map();
+let configCache = new Map();
 
 // --- INICIALIZAÇÃO ---
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ---------------------------------------------------------------------------
-// CONFIGURAÇÃO MQTT (CLIENT ID ÚNICO PARA VPS)
-// ---------------------------------------------------------------------------
 const client = mqtt.connect(BROKER_URL, {
     clientId: 'alcateia_vps_' + Math.random().toString(16).substring(2, 10),
     clean: true,
@@ -71,178 +76,101 @@ const calcularBateria = (mVolts) => {
     return Math.max(0, Math.min(100, Math.round(((mVolts - MIN) / (MAX - MIN)) * 100)));
 };
 
-// --- ROTINA: RELATÓRIO INTELIGENTE PARA AGENTE DE VOZ (VIA N8N) ---
-const processarRelatorioVoz = async () => {
-    logger.info('🗣️ Iniciando verificação para Agente de Voz...');
-
-    const TEMPO_LIMITE_PORTA_MS = 5 * 60 * 1000; // 5 minutos permitidos
-
-    // 1. Busca configurações APENAS de sensores ativos
-    const { data: configs } = await supabase
-        .from('sensor_configs')
-        .select('*')
-        .eq('em_manutencao', false);
-
-    if (!configs || configs.length === 0) return;
-
-    // 2. Busca logs de Telemetria (Temp/Hum)
-    const { data: logsTelemetria } = await supabase
-        .from('telemetry_logs')
-        .select('mac, temp, hum, ts')
-        .order('ts', { ascending: false })
-        .limit(2000);
-
-    // 3. Busca logs de Portas (Limite maior para rastrear histórico)
-    const { data: logsPortas } = await supabase
-        .from('door_logs')
-        .select('sensor_mac, is_open, timestamp_read')
-        .order('timestamp_read', { ascending: false })
-        .limit(3000);
-
-    // 4. Estruturação dos Dados
-    // Mapa Telemetria (Apenas última leitura)
-    const ultimasLeituras = new Map();
-    if (logsTelemetria) {
-        logsTelemetria.forEach(log => {
-            if (!ultimasLeituras.has(log.mac)) ultimasLeituras.set(log.mac, log);
-        });
-    }
-
-    // Mapa Portas (Array histórico por sensor)
-    const historicoPortas = {};
-    if (logsPortas) {
-        logsPortas.forEach(log => {
-            if (!historicoPortas[log.sensor_mac]) historicoPortas[log.sensor_mac] = [];
-            historicoPortas[log.sensor_mac].push(log);
-        });
-    }
-
-    // 5. Análise de Regras
-    let frasesDeAlerta = [];
-    let detalhesTecnicos = []; 
-
-    configs.forEach(config => {
-        const leitura = ultimasLeituras.get(config.mac);
-        const logsDoSensor = historicoPortas[config.mac];
-        
-        const nomeFalado = (config.display_name || "Sensor desconhecido").replace(/_/g, " ");
-        let problemasSensor = [];
-
-        // --- A. Regra: Temperatura e Umidade ---
-        if (leitura) {
-            // Verifica Temperatura Máxima
-            if (config.temp_max !== null && leitura.temp > config.temp_max) {
-                const valor = leitura.temp.toFixed(1).replace('.', ','); 
-                problemasSensor.push(`temperatura alta de ${valor} graus`);
-            }
-            // Verifica Umidade Máxima
-            if (config.hum_max !== null && leitura.hum > config.hum_max) {
-                const valor = leitura.hum.toFixed(0); 
-                problemasSensor.push(`umidade alta de ${valor} por cento`);
-            }
-        }
-
-        // --- B. Regra: Porta Esquecida Aberta (> 5 min) ---
-        if (logsDoSensor && logsDoSensor.length > 0) {
-            // log[0] é o estado atual
-            const estadoAtual = logsDoSensor[0];
-
-            if (estadoAtual.is_open === true) {
-                // A porta está aberta AGORA. Vamos voltar no tempo para ver desde quando.
-                let dataInicioAbertura = new Date(estadoAtual.timestamp_read);
-                
-                // Percorre do mais novo para o mais antigo
-                for (let i = 0; i < logsDoSensor.length; i++) {
-                    if (logsDoSensor[i].is_open === false) {
-                        // Achamos quando ela estava fechada. Paramos.
-                        break;
-                    }
-                    // Enquanto for true, empurramos o início para trás
-                    dataInicioAbertura = new Date(logsDoSensor[i].timestamp_read);
-                }
-
-                const agora = new Date();
-                const tempoAbertoMs = agora - dataInicioAbertura;
-
-                // Se superou o limite de tolerância
-                if (tempoAbertoMs > TEMPO_LIMITE_PORTA_MS) {
-                    const minutos = Math.floor(tempoAbertoMs / 60000);
-                    problemasSensor.push(`porta aberta há ${minutos} minutos`);
-                }
-            }
-        }
-
-        // --- C. Consolidação dos Alertas ---
-        if (problemasSensor.length > 0) {
-            // Ex: "No Câmara 1, foi detectado temperatura alta... E porta aberta..."
-            frasesDeAlerta.push(`No ${nomeFalado}, foi detectado ${problemasSensor.join(' e ')}.`);
-            
-            detalhesTecnicos.push({
-                sensor: config.display_name,
-                temp: leitura ? leitura.temp : null,
-                problemas: problemasSensor
-            });
-        }
-    });
-
-    // 6. Envio para N8N (apenas se houver alertas)
-    if (frasesDeAlerta.length === 0) {
-        logger.info('✅ Voz: Tudo normal (Parâmetros OK e portas fechadas/recentes).');
-        return; 
-    }
-
-    const saudacao = "Olá, monitoramento da Alcateia informa.";
-    const corpoMensagem = frasesDeAlerta.join(' Além disso, ');
-    const conclusao = "Verifique o painel imediatamente.";
-    
-    const textoCompletoTTS = `${saudacao} ${corpoMensagem} ${conclusao}`;
-
-    const payload = {
-        trigger_reason: "critical_report_voice",
-        has_alerts: true,
-        timestamp: new Date().toISOString(),
-        tts_message: textoCompletoTTS,
-        alert_count: frasesDeAlerta.length,
-        raw_data: detalhesTecnicos
-    };
-
+// --- GESTÃO DE CACHE DE CONFIGURAÇÕES ---
+const atualizarCacheConfiguracoes = async () => {
     try {
-        logger.info(`📞 Enviando alerta de voz (${frasesDeAlerta.length} ocorrências) para o N8N...`);
-        
-        const response = await fetch('https://n8n.alcateia-ia.com/webhook/coldchain/alertas', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
+        const { data: configs, error } = await supabase
+            .from('sensor_configs')
+            .select('mac, temp_max, hum_max, display_name')
+            .eq('em_manutencao', false);
 
-        if (response.ok) logger.info('✅ Webhook N8N acionado com sucesso.');
-        else logger.error(`❌ Erro no Webhook N8N: ${response.statusText}`);
+        if (error) throw error;
 
-    } catch (error) {
-        logger.error(`❌ Falha na conexão com N8N: ${error.message}`);
+        const novoCache = new Map();
+        configs.forEach(c => novoCache.set(c.mac, c));
+        configCache = novoCache;
+        logger.info(`🔄 [CACHE] Configurações atualizadas: ${configCache.size} sensores ativos.`);
+    } catch (e) {
+        logger.error(`❌ [CACHE] Erro ao atualizar: ${e.message}`);
     }
 };
 
-// Agenda a rotina de voz para rodar a cada 30 minutos
-cron.schedule('*/30 * * * *', () => processarRelatorioVoz());
+setTimeout(atualizarCacheConfiguracoes, 1000);
+setInterval(atualizarCacheConfiguracoes, 10 * 60 * 1000);
 
-// --- EVENTOS MQTT (Gravação de Dados) ---
+// --- LÓGICA DE VERIFICAÇÃO DE REGRAS ---
+const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
+    const config = configCache.get(sensorMac);
+    if (!config) return null; 
+
+    let falhas = [];
+    const nome = config.display_name || sensorMac;
+
+    // 1. Temperatura
+    if (leituraAtual.temp !== undefined && config.temp_max !== null) {
+        if (leituraAtual.temp > config.temp_max) {
+            falhas.push(`temperatura alta (${leituraAtual.temp.toFixed(1)}°C)`);
+        }
+    }
+
+    // 2. Umidade
+    if (leituraAtual.humidity !== undefined && config.hum_max !== null) {
+        if (leituraAtual.humidity > config.hum_max) {
+            falhas.push(`umidade alta (${leituraAtual.humidity.toFixed(0)}%)`);
+        }
+    }
+
+    // 3. Porta
+    if (leituraAtual.alarm !== undefined) {
+        const isOpen = leituraAtual.alarm > 0;
+        if (isOpen) {
+            if (!estadoMemoria.open_since) estadoMemoria.open_since = Date.now();
+            const tempoAberto = Date.now() - estadoMemoria.open_since;
+            if (tempoAberto > DOOR_TIME_LIMIT) {
+                const minutos = Math.floor(tempoAberto / 60000);
+                falhas.push(`porta aberta há ${minutos} min`);
+            }
+        } else {
+            estadoMemoria.open_since = null;
+        }
+    }
+
+    if (falhas.length === 0) return null;
+
+    // 4. Cooldown
+    const lastAlert = alertControl.get(sensorMac)?.last_alert_ts || 0;
+    const now = Date.now();
+
+    if (now - lastAlert < ALERT_COOLDOWN) return null;
+
+    alertControl.set(sensorMac, { last_alert_ts: now });
+
+    return {
+        sensor_mac: sensorMac,
+        sensor_nome: nome,
+        descricao_problemas: falhas,
+        leitura_atual: {
+            temp: leituraAtual.temp,
+            hum: leituraAtual.humidity,
+            porta_aberta: leituraAtual.alarm > 0,
+            bateria: calcularBateria(leituraAtual.vbatt)
+        },
+        limites_configurados: {
+            temp_max: config.temp_max,
+            hum_max: config.hum_max
+        }
+    };
+};
+
+// --- EVENTOS MQTT ---
 
 client.on('connect', () => {
     logger.info(`✅ [MQTT] Conectado! ID: ${client.options.clientId}`);
-    
     client.subscribe(TOPIC_DATA, (err) => {
-        if (!err) {
-            logger.info(`📡 [MQTT] Inscrito no tópico: ${TOPIC_DATA}`);
-        } else {
-            logger.error(`❌ [MQTT] Erro na inscrição: ${err.message}`);
-        }
+        if (!err) logger.info(`📡 [MQTT] Inscrito: ${TOPIC_DATA}`);
+        else logger.error(`❌ [MQTT] Erro inscrição: ${err.message}`);
     });
 });
-
-client.on('reconnect', () => logger.warn('⚠️ [MQTT] Tentando reconectar...'));
-client.on('offline', () => logger.warn('🔌 [MQTT] Cliente offline.'));
-client.on('error', (err) => logger.error(`🔥 [MQTT] Erro: ${err.message}`));
 
 client.on('message', async (topic, message) => {
     if (topic !== TOPIC_DATA) return;
@@ -250,80 +178,121 @@ client.on('message', async (topic, message) => {
     try {
         const payloadStr = message.toString();
         const payload = JSON.parse(payloadStr);
-        
-        const batchTelemetria = [];
-        const batchPortas = [];
         const items = Array.isArray(payload) ? payload : [payload];
         const now = Date.now();
+
+        // LOG DE ENTRADA (DEBUG VISUAL)
+        logger.info(`📥 [MQTT] Recebido pacote com ${items.length} gateway(s).`);
+
+        const dbBatchPortas = [];
+        const dbBatchTelemetria = [];
+        const alertasConsolidados = [];
+        let sensoresProcessadosCount = 0;
 
         items.forEach((item) => {
             if (item.obj && Array.isArray(item.obj)) {
                 const gwMac = formatarMac(item.gmac);
-                
+                sensoresProcessadosCount += item.obj.length;
+
                 item.obj.forEach(sensor => {
                     const sensorMac = formatarMac(sensor.dmac);
                     const vbatt = calcularBateria(sensor.vbatt);
-                    const last = lastReadings.get(sensorMac) || { temp: 0, hum: 0, state: null, ts: 0 };
+                    
+                    let last = lastReadings.get(sensorMac) || { temp: 0, hum: 0, state: null, ts: 0, open_since: null };
                     const timeDiff = now - last.ts;
 
-                    // 1. PORTAS (Gravação em door_logs)
+                    // --- A. ALERTAS ---
+                    const alertaSensor = verificarSensorIndividual(sensorMac, sensor, last);
+                    if (alertaSensor) {
+                        alertasConsolidados.push(alertaSensor);
+                    }
+
+                    // --- B. GRAVAÇÃO DB ---
+                    // 1. Portas
                     if (PROCESS_DOORS && sensor.alarm !== undefined) {
                         const isOpen = sensor.alarm > 0;
-                        // Grava se mudou o estado OU se passou muito tempo (heartbeat da porta)
                         if (isOpen !== last.state || timeDiff > DOOR_DEBOUNCE_MS) {
-                            batchPortas.push({
-                                gateway_mac: gwMac, 
-                                sensor_mac: sensorMac,
-                                timestamp_read: new Date().toISOString(),
-                                battery_percent: vbatt, 
-                                is_open: isOpen, 
-                                alarm_code: sensor.alarm,
-                                rssi: sensor.rssi
+                            dbBatchPortas.push({
+                                gateway_mac: gwMac, sensor_mac: sensorMac, timestamp_read: new Date().toISOString(),
+                                battery_percent: vbatt, is_open: isOpen, alarm_code: sensor.alarm, rssi: sensor.rssi
                             });
-                            lastReadings.set(sensorMac, { ...last, state: isOpen, ts: now });
+                            last.state = isOpen;
+                            last.ts = now;
                         }
-                    } 
-                    
-                    // 2. TELEMETRIA (Gravação em telemetry_logs)
+                    }
+
+                    // 2. Telemetria
                     else if (PROCESS_GPS && (sensor.temp !== undefined)) {
                         const diffTemp = Math.abs(sensor.temp - last.temp);
                         const diffHum = Math.abs((sensor.humidity || 0) - last.hum);
 
                         if (diffTemp >= VAR_TEMP_MIN || diffHum >= VAR_HUM_MIN || timeDiff > ANALOG_MAX_AGE_MS) {
-                            batchTelemetria.push({
-                                gw: gwMac, 
-                                mac: sensorMac, 
-                                ts: new Date().toISOString(),
-                                batt: vbatt, 
-                                temp: sensor.temp, 
-                                hum: sensor.humidity,
-                                rssi: sensor.rssi,
+                            dbBatchTelemetria.push({
+                                gw: gwMac, mac: sensorMac, ts: new Date().toISOString(),
+                                batt: vbatt, temp: sensor.temp, hum: sensor.humidity, rssi: sensor.rssi,
                                 latitude: (item.location?.err === 0) ? item.location.latitude : null,
                                 longitude: (item.location?.err === 0) ? item.location.longitude : null
                             });
-                            lastReadings.set(sensorMac, { ...last, temp: sensor.temp, hum: sensor.humidity, ts: now });
+                            last.temp = sensor.temp;
+                            last.hum = sensor.humidity;
+                            last.ts = now;
                         }
                     }
+                    lastReadings.set(sensorMac, last);
                 });
             }
         });
 
-        // Gravação no Banco Supabase
-        if (batchPortas.length > 0) {
-            const { error } = await supabase.from('door_logs').insert(batchPortas);
-            if (!error) logger.info(`🚪 ${batchPortas.length} logs de porta salvos.`);
-            else logger.error(`❌ Erro Supabase Porta: ${error.message}`);
+        // --- C. AÇÕES FINAIS ---
+
+        // 1. Disparo N8N
+        if (alertasConsolidados.length > 0) {
+            const qtd = alertasConsolidados.length;
+            const nomes = alertasConsolidados.map(a => a.sensor_nome).join(', ');
+            const ttsMessage = `Atenção. ${qtd} ocorrências críticas: ${nomes}.`;
+
+            logger.info(`🚨 [N8N] Enviando ${qtd} alertas...`);
+
+            fetch('https://n8n.alcateia-ia.com/webhook/coldchain/alertas', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    timestamp: new Date().toISOString(),
+                    qtd_alertas: qtd,
+                    tts_message: ttsMessage,
+                    alertas: alertasConsolidados
+                })
+            }).catch(err => logger.error(`❌ [N8N] Falha: ${err.message}`));
+        } else {
+            // LOG STATUS NORMAL
+            logger.info(`✅ [STATUS] Processados ${sensoresProcessadosCount} sensores. Nenhum alerta crítico.`);
         }
 
-        if (batchTelemetria.length > 0) {
-            const { error } = await supabase.from('telemetry_logs').insert(batchTelemetria);
-            if (!error) logger.info(`🌡️ ${batchTelemetria.length} logs de telemetria salvos.`);
-            else logger.error(`❌ Erro Supabase Telemetria: ${error.message}`);
+        // 2. Gravação DB (Com logs de sucesso)
+        if (dbBatchPortas.length > 0) {
+            supabase.from('door_logs').insert(dbBatchPortas)
+                .then(({ error }) => { 
+                    if (error) logger.error(`❌ DB Porta: ${error.message}`);
+                    else logger.info(`🚪 [DB] ${dbBatchPortas.length} logs de porta salvos.`);
+                });
+        }
+
+        if (dbBatchTelemetria.length > 0) {
+            supabase.from('telemetry_logs').insert(dbBatchTelemetria)
+                .then(({ error }) => { 
+                    if (error) logger.error(`❌ DB Telemetria: ${error.message}`);
+                    else logger.info(`🌡️ [DB] ${dbBatchTelemetria.length} logs de telemetria salvos.`);
+                });
         }
 
     } catch (e) {
-        logger.error(`❌ Erro no processamento da mensagem: ${e.message}`);
+        logger.error(`❌ Erro Processamento MSG: ${e.message}`);
     }
 });
 
+client.on('reconnect', () => logger.warn('⚠️ [MQTT] Reconectando...'));
+client.on('offline', () => logger.warn('🔌 [MQTT] Offline.'));
+client.on('error', (err) => logger.error(`🔥 [MQTT] Erro: ${err.message}`));
+
+app.get('/', (req, res) => res.send('Alcateia Gateway Processing Online'));
 app.listen(PORT, () => logger.info(`🚀 API Online na porta ${PORT}`));

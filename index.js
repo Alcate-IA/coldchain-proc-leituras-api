@@ -9,7 +9,6 @@ import winston from 'winston';
 dotenv.config();
 
 // --- CONFIGURAÇÃO DO LOGGER (WINSTON) ---
-// Configurado para exibir logs no Console E salvar em arquivo
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.combine(
@@ -19,7 +18,6 @@ const logger = winston.createLogger({
     transports: [
         new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
         new winston.transports.File({ filename: 'logs/combined.log' }),
-        // Adicionado Console explicitamente para debug na VPS
         new winston.transports.Console({
             format: winston.format.combine(
                 winston.format.colorize(),
@@ -33,9 +31,9 @@ const logger = winston.createLogger({
 const PORT = process.env.PORT || 3030;
 const BROKER_URL = 'mqtt://broker.hivemq.com';
 
-// Filtros e Deadbands
-const DOOR_DEBOUNCE_MS = 5000;      // 5 segundos para porta
-const ANALOG_MAX_AGE_MS = 300000;   // 5 minutos (heartbeat)
+// Filtros e Deadbands para Gravação
+const DOOR_DEBOUNCE_MS = 5000;      // 5 segundos para porta (para gravar no banco)
+const ANALOG_MAX_AGE_MS = 300000;   // 5 minutos (heartbeat gravação)
 const VAR_TEMP_MIN = 0.5;           // Variação min de Temperatura
 const VAR_HUM_MIN = 1.0;            // Variação min de Umidade
 
@@ -53,8 +51,7 @@ const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // ---------------------------------------------------------------------------
-// CORREÇÃO CRÍTICA PARA VPS: CLIENT ID ÚNICO
-// Gera um ID aleatório a cada reinício para evitar conflito com versão local
+// CONFIGURAÇÃO MQTT (CLIENT ID ÚNICO PARA VPS)
 // ---------------------------------------------------------------------------
 const client = mqtt.connect(BROKER_URL, {
     clientId: 'alcateia_vps_' + Math.random().toString(16).substring(2, 10),
@@ -74,78 +71,127 @@ const calcularBateria = (mVolts) => {
     return Math.max(0, Math.min(100, Math.round(((mVolts - MIN) / (MAX - MIN)) * 100)));
 };
 
-// --- ROTINA: RELATÓRIO PARA AGENTE DE VOZ (VIA N8N) ---
+// --- ROTINA: RELATÓRIO INTELIGENTE PARA AGENTE DE VOZ (VIA N8N) ---
 const processarRelatorioVoz = async () => {
     logger.info('🗣️ Iniciando verificação para Agente de Voz...');
 
-    // 1. Busca configurações APENAS de sensores ativos (em_manutencao = false)
+    const TEMPO_LIMITE_PORTA_MS = 5 * 60 * 1000; // 5 minutos permitidos
+
+    // 1. Busca configurações APENAS de sensores ativos
     const { data: configs } = await supabase
         .from('sensor_configs')
         .select('*')
         .eq('em_manutencao', false);
 
-    if (!configs || configs.length === 0) {
-        // Se não tiver sensores ativos, não faz nada
-        return;
-    }
+    if (!configs || configs.length === 0) return;
 
-    // 2. Busca logs recentes
-    const { data: logs } = await supabase
+    // 2. Busca logs de Telemetria (Temp/Hum)
+    const { data: logsTelemetria } = await supabase
         .from('telemetry_logs')
         .select('mac, temp, hum, ts')
         .order('ts', { ascending: false })
         .limit(2000);
 
-    if (!logs) return;
+    // 3. Busca logs de Portas (Limite maior para rastrear histórico)
+    const { data: logsPortas } = await supabase
+        .from('door_logs')
+        .select('sensor_mac, is_open, timestamp_read')
+        .order('timestamp_read', { ascending: false })
+        .limit(3000);
 
-    // 3. Deduplicação (Última leitura por MAC)
+    // 4. Estruturação dos Dados
+    // Mapa Telemetria (Apenas última leitura)
     const ultimasLeituras = new Map();
-    logs.forEach(log => {
-        if (!ultimasLeituras.has(log.mac)) ultimasLeituras.set(log.mac, log);
-    });
+    if (logsTelemetria) {
+        logsTelemetria.forEach(log => {
+            if (!ultimasLeituras.has(log.mac)) ultimasLeituras.set(log.mac, log);
+        });
+    }
 
-    // 4. Análise de Alertas
+    // Mapa Portas (Array histórico por sensor)
+    const historicoPortas = {};
+    if (logsPortas) {
+        logsPortas.forEach(log => {
+            if (!historicoPortas[log.sensor_mac]) historicoPortas[log.sensor_mac] = [];
+            historicoPortas[log.sensor_mac].push(log);
+        });
+    }
+
+    // 5. Análise de Regras
     let frasesDeAlerta = [];
     let detalhesTecnicos = []; 
 
     configs.forEach(config => {
         const leitura = ultimasLeituras.get(config.mac);
-        if (!leitura) return;
-
+        const logsDoSensor = historicoPortas[config.mac];
+        
         const nomeFalado = (config.display_name || "Sensor desconhecido").replace(/_/g, " ");
         let problemasSensor = [];
 
-        // Verifica Temperatura
-        if (config.temp_max !== null && leitura.temp > config.temp_max) {
-            const valor = leitura.temp.toFixed(1).replace('.', ','); 
-            problemasSensor.push(`temperatura alta de ${valor} graus`);
+        // --- A. Regra: Temperatura e Umidade ---
+        if (leitura) {
+            // Verifica Temperatura Máxima
+            if (config.temp_max !== null && leitura.temp > config.temp_max) {
+                const valor = leitura.temp.toFixed(1).replace('.', ','); 
+                problemasSensor.push(`temperatura alta de ${valor} graus`);
+            }
+            // Verifica Umidade Máxima
+            if (config.hum_max !== null && leitura.hum > config.hum_max) {
+                const valor = leitura.hum.toFixed(0); 
+                problemasSensor.push(`umidade alta de ${valor} por cento`);
+            }
         }
 
-        // Verifica Umidade
-        if (config.hum_max !== null && leitura.hum > config.hum_max) {
-            const valor = leitura.hum.toFixed(0); 
-            problemasSensor.push(`umidade alta de ${valor} por cento`);
+        // --- B. Regra: Porta Esquecida Aberta (> 5 min) ---
+        if (logsDoSensor && logsDoSensor.length > 0) {
+            // log[0] é o estado atual
+            const estadoAtual = logsDoSensor[0];
+
+            if (estadoAtual.is_open === true) {
+                // A porta está aberta AGORA. Vamos voltar no tempo para ver desde quando.
+                let dataInicioAbertura = new Date(estadoAtual.timestamp_read);
+                
+                // Percorre do mais novo para o mais antigo
+                for (let i = 0; i < logsDoSensor.length; i++) {
+                    if (logsDoSensor[i].is_open === false) {
+                        // Achamos quando ela estava fechada. Paramos.
+                        break;
+                    }
+                    // Enquanto for true, empurramos o início para trás
+                    dataInicioAbertura = new Date(logsDoSensor[i].timestamp_read);
+                }
+
+                const agora = new Date();
+                const tempoAbertoMs = agora - dataInicioAbertura;
+
+                // Se superou o limite de tolerância
+                if (tempoAbertoMs > TEMPO_LIMITE_PORTA_MS) {
+                    const minutos = Math.floor(tempoAbertoMs / 60000);
+                    problemasSensor.push(`porta aberta há ${minutos} minutos`);
+                }
+            }
         }
 
+        // --- C. Consolidação dos Alertas ---
         if (problemasSensor.length > 0) {
+            // Ex: "No Câmara 1, foi detectado temperatura alta... E porta aberta..."
             frasesDeAlerta.push(`No ${nomeFalado}, foi detectado ${problemasSensor.join(' e ')}.`);
             
             detalhesTecnicos.push({
                 sensor: config.display_name,
-                temp: leitura.temp,
-                hum: leitura.hum,
-                limite_temp: config.temp_max
+                temp: leitura ? leitura.temp : null,
+                problemas: problemasSensor
             });
         }
     });
 
-    // 5. Envio (Se houver alertas)
+    // 6. Envio para N8N (apenas se houver alertas)
     if (frasesDeAlerta.length === 0) {
-        logger.info('✅ Voz: Tudo normal. Nenhum alerta gerado.');
+        logger.info('✅ Voz: Tudo normal (Parâmetros OK e portas fechadas/recentes).');
         return; 
     }
 
-    const saudacao = "Olá, aqui é o monitoramento da Alcateia. Atenção para os seguintes alertas.";
+    const saudacao = "Olá, monitoramento da Alcateia informa.";
     const corpoMensagem = frasesDeAlerta.join(' Além disso, ');
     const conclusao = "Verifique o painel imediatamente.";
     
@@ -180,7 +226,7 @@ const processarRelatorioVoz = async () => {
 // Agenda a rotina de voz para rodar a cada 30 minutos
 cron.schedule('*/30 * * * *', () => processarRelatorioVoz());
 
-// --- EVENTOS MQTT ---
+// --- EVENTOS MQTT (Gravação de Dados) ---
 
 client.on('connect', () => {
     logger.info(`✅ [MQTT] Conectado! ID: ${client.options.clientId}`);
@@ -199,9 +245,6 @@ client.on('offline', () => logger.warn('🔌 [MQTT] Cliente offline.'));
 client.on('error', (err) => logger.error(`🔥 [MQTT] Erro: ${err.message}`));
 
 client.on('message', async (topic, message) => {
-    // Log de diagnóstico para confirmar recebimento na VPS
-    // logger.info(`📨 Recebido: ${message.length} bytes`); // Descomente se quiser muito detalhe
-
     if (topic !== TOPIC_DATA) return;
 
     try {
@@ -223,9 +266,10 @@ client.on('message', async (topic, message) => {
                     const last = lastReadings.get(sensorMac) || { temp: 0, hum: 0, state: null, ts: 0 };
                     const timeDiff = now - last.ts;
 
-                    // 1. PORTAS
+                    // 1. PORTAS (Gravação em door_logs)
                     if (PROCESS_DOORS && sensor.alarm !== undefined) {
                         const isOpen = sensor.alarm > 0;
+                        // Grava se mudou o estado OU se passou muito tempo (heartbeat da porta)
                         if (isOpen !== last.state || timeDiff > DOOR_DEBOUNCE_MS) {
                             batchPortas.push({
                                 gateway_mac: gwMac, 
@@ -240,7 +284,7 @@ client.on('message', async (topic, message) => {
                         }
                     } 
                     
-                    // 2. TELEMETRIA (TEMP/HUM)
+                    // 2. TELEMETRIA (Gravação em telemetry_logs)
                     else if (PROCESS_GPS && (sensor.temp !== undefined)) {
                         const diffTemp = Math.abs(sensor.temp - last.temp);
                         const diffHum = Math.abs((sensor.humidity || 0) - last.hum);

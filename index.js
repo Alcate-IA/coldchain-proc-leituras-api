@@ -44,6 +44,7 @@ const VAR_HUM_MIN = 1.0;            // Variação min Hum
 // Regras de Alerta (Memória)
 const ALERT_COOLDOWN = 20 * 60 * 1000; // 20 minutos de silêncio para o MESMO sensor
 const DOOR_TIME_LIMIT = 5 * 60 * 1000; // 5 minutos porta aberta para gerar alerta
+const TEMP_TOLERANCE = 1.0;            // <--- NOVA CONSTANTE: Tolerância de 1 grau
 
 // Feature Flags
 const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';
@@ -105,7 +106,7 @@ app.all('/api/refresh-config', async (req, res) => {
 setTimeout(atualizarCacheConfiguracoes, 1000);
 setInterval(atualizarCacheConfiguracoes, 10 * 60 * 1000);
 
-// --- LÓGICA DE VERIFICAÇÃO DE REGRAS (CORRIGIDA) ---
+// --- LÓGICA DE VERIFICAÇÃO DE REGRAS (ATUALIZADA) ---
 const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
     const config = configCache.get(sensorMac);
     if (!config) return null; 
@@ -113,22 +114,22 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
     let falhas = [];
     const nome = config.display_name || sensorMac;
 
-    // 1. Temperatura (Correção para números negativos)
+    // 1. Temperatura (Com Tolerância de 1 Grau)
     if (leituraAtual.temp !== undefined && config.temp_max !== null) {
-        // Forçamos a conversão para Number para evitar comparação de String
-        // Ex: Number("-6") > Number("-5") => -6 > -5 => false (Correto, não alerta)
-        // Ex: Number("-4") > Number("-5") => -4 > -5 => true (Correto, alerta pois esquentou)
         const tempAtual = Number(leituraAtual.temp);
         const tempLimite = Number(config.temp_max);
 
         if (!isNaN(tempAtual) && !isNaN(tempLimite)) {
-            if (tempAtual > tempLimite) {
+            // AQUI ESTÁ A MUDANÇA:
+            // Só alerta se a temperatura atual for maior que (Limite + Tolerância)
+            // Ex: Limite -5 + 1 = -4. Se temp for -3, alerta. Se for -4.5, não alerta.
+            if (tempAtual > (tempLimite + TEMP_TOLERANCE)) {
                 falhas.push(`temperatura alta de ${tempAtual.toFixed(1)} graus`);
             }
         }
     }
 
-    // 2. Umidade (Conversão de segurança)
+    // 2. Umidade
     if (leituraAtual.humidity !== undefined && config.hum_max !== null) {
         const humAtual = Number(leituraAtual.humidity);
         const humLimite = Number(config.hum_max);
@@ -165,12 +166,9 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
 
     alertControl.set(sensorMac, { last_alert_ts: now });
 
-    // RETORNA DADOS NECESSÁRIOS PARA O PAYLOAD
     return {
         sensor_nome: nome,
-        descricao_problemas: falhas, // Array de strings formatadas para voz
-        
-        // Dados crus para raw_data
+        descricao_problemas: falhas,
         dados_brutos: {
             sensor: nome,
             temp: leituraAtual.temp,
@@ -265,18 +263,13 @@ client.on('message', async (topic, message) => {
 
         if (alertasConsolidados.length > 0) {
             const qtd = alertasConsolidados.length;
-
-            // 1. Constrói o raw_data (Array Limpo)
             const rawData = alertasConsolidados.map(a => a.dados_brutos);
-
-            // 2. Constrói a mensagem de voz (TTS)
             const frasesDetalhadas = alertasConsolidados.map(a => {
                 return `No ${a.sensor_nome}, foi detectado ${a.descricao_problemas.join(' e ')}`;
             });
 
             const ttsMessage = `Olá, aqui é o monitoramento da Alcateia. Atenção para os seguintes alertas. ${frasesDetalhadas.join('. ')}. Verifique o painel imediatamente.`;
 
-            // 3. Monta o Payload Final
             const payloadN8N = {
                 trigger_reason: "critical_report_voice",
                 has_alerts: true,
@@ -298,7 +291,7 @@ client.on('message', async (topic, message) => {
             logger.info(`✅ [STATUS] Processados ${sensoresProcessadosCount} sensores. Nenhum alerta crítico.`);
         }
 
-        // Gravação DB (Mantida igual)
+        // Gravação DB
         if (dbBatchPortas.length > 0) {
             supabase.from('door_logs').insert(dbBatchPortas)
                 .then(({ error }) => { 
@@ -324,5 +317,4 @@ client.on('reconnect', () => logger.warn('⚠️ [MQTT] Reconectando...'));
 client.on('offline', () => logger.warn('🔌 [MQTT] Offline.'));
 client.on('error', (err) => logger.error(`🔥 [MQTT] Erro: ${err.message}`));
 
-// --- INICIALIZAÇÃO DO SERVIDOR EXPRESS ---
 app.listen(PORT, () => logger.info(`🚀 API Online na porta ${PORT}`));

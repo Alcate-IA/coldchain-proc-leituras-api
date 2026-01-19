@@ -105,7 +105,7 @@ app.all('/api/refresh-config', async (req, res) => {
 setTimeout(atualizarCacheConfiguracoes, 1000);
 setInterval(atualizarCacheConfiguracoes, 10 * 60 * 1000);
 
-// --- LÓGICA DE VERIFICAÇÃO DE REGRAS ---
+// --- LÓGICA DE VERIFICAÇÃO DE REGRAS (CORRIGIDA) ---
 const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
     const config = configCache.get(sensorMac);
     if (!config) return null; 
@@ -113,17 +113,30 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
     let falhas = [];
     const nome = config.display_name || sensorMac;
 
-    // 1. Temperatura
+    // 1. Temperatura (Correção para números negativos)
     if (leituraAtual.temp !== undefined && config.temp_max !== null) {
-        if (leituraAtual.temp > config.temp_max) {
-            falhas.push(`temperatura alta de ${leituraAtual.temp.toFixed(1)} graus`);
+        // Forçamos a conversão para Number para evitar comparação de String
+        // Ex: Number("-6") > Number("-5") => -6 > -5 => false (Correto, não alerta)
+        // Ex: Number("-4") > Number("-5") => -4 > -5 => true (Correto, alerta pois esquentou)
+        const tempAtual = Number(leituraAtual.temp);
+        const tempLimite = Number(config.temp_max);
+
+        if (!isNaN(tempAtual) && !isNaN(tempLimite)) {
+            if (tempAtual > tempLimite) {
+                falhas.push(`temperatura alta de ${tempAtual.toFixed(1)} graus`);
+            }
         }
     }
 
-    // 2. Umidade
+    // 2. Umidade (Conversão de segurança)
     if (leituraAtual.humidity !== undefined && config.hum_max !== null) {
-        if (leituraAtual.humidity > config.hum_max) {
-            falhas.push(`umidade alta de ${leituraAtual.humidity.toFixed(0)} por cento`);
+        const humAtual = Number(leituraAtual.humidity);
+        const humLimite = Number(config.hum_max);
+
+        if (!isNaN(humAtual) && !isNaN(humLimite)) {
+            if (humAtual > humLimite) {
+                falhas.push(`umidade alta de ${humAtual.toFixed(0)} por cento`);
+            }
         }
     }
 
@@ -258,7 +271,6 @@ client.on('message', async (topic, message) => {
 
             // 2. Constrói a mensagem de voz (TTS)
             const frasesDetalhadas = alertasConsolidados.map(a => {
-                // "No [Sensor], foi detectado [temp alta] e [porta aberta]"
                 return `No ${a.sensor_nome}, foi detectado ${a.descricao_problemas.join(' e ')}`;
             });
 

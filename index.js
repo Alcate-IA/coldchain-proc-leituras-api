@@ -38,14 +38,17 @@ const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';
 // Filtros de Gravação (DB)
 const DOOR_DEBOUNCE_MS = 5000;      // 5s para gravar alteração de porta
 const ANALOG_MAX_AGE_MS = 300000;   // 5min heartbeat gravação
-const VAR_TEMP_MIN = 0.5;           // Variação min Temp
-const VAR_HUM_MIN = 1.0;            // Variação min Hum
+const VAR_TEMP_MIN = 0.5;           // Variação min Temp para gravar no DB
+const VAR_HUM_MIN = 1.0;            // Variação min Hum para gravar no DB
 
 // --- REGRAS DE ALERTA E LISTA DE ACOMPANHAMENTO ---
-const WATCHLIST_DELAY_MS = 5 * 60 * 1000; // 5 Min: Tempo de persistência para Temperatura
+const WATCHLIST_DELAY_MS = 5 * 60 * 1000; // 5 Min: Tempo de persistência para Temp/Hum
 const ALERT_COOLDOWN = 20 * 60 * 1000;    // 20 Min: Silêncio após enviar alerta
 const DOOR_TIME_LIMIT = 5 * 60 * 1000;    // 5 Min: Tempo para considerar porta aberta erro
-const TEMP_TOLERANCE = 1.0;               // 1.0°C: Tolerância acima do limite
+
+// Tolerâncias para evitar "flapping" (alerta falso por oscilação pequena)
+const TEMP_TOLERANCE = 1.0;               // 1.0°C
+const HUM_TOLERANCE = 2.0;                // 2.0%
 
 // Feature Flags
 const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';
@@ -82,9 +85,10 @@ const calcularBateria = (mVolts) => {
 // --- GESTÃO DE CACHE ---
 const atualizarCacheConfiguracoes = async () => {
     try {
+        // Busca configurações incluindo os novos campos Min/Max
         const { data: configs, error } = await supabase
             .from('sensor_configs')
-            .select('mac, temp_max, hum_max, display_name')
+            .select('mac, temp_max, temp_min, hum_max, hum_min, display_name')
             .eq('em_manutencao', false);
 
         if (error) throw error;
@@ -116,21 +120,52 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
     const nome = config.display_name || sensorMac;
     let problemasDetectados = [];
     
-    // Flag: Se for true, ignora o tempo de espera da watchlist e alerta logo
+    // Flag: Se for true, ignora o tempo de espera da watchlist e alerta logo (ex: porta aberta a muito tempo)
     let furarFilaWatchlist = false; 
 
-    // 1. ANÁLISE DE TEMPERATURA (Sujeito à Watchlist)
-    if (leituraAtual.temp !== undefined && config.temp_max !== null) {
+    // 1. ANÁLISE DE TEMPERATURA (Min/Max)
+    if (leituraAtual.temp !== undefined) {
         const tempAtual = Number(leituraAtual.temp);
-        const tempLimite = Number(config.temp_max);
         
-        // Ex: Limite -5 + 1 = -4. Se temp for -3 (maior que -4), gera alerta.
-        if (!isNaN(tempAtual) && !isNaN(tempLimite) && tempAtual > (tempLimite + TEMP_TOLERANCE)) {
-            problemasDetectados.push(`temperatura alta de ${tempAtual.toFixed(1)} graus`);
+        // Verificação Teto (Máximo)
+        if (config.temp_max !== null) {
+            const tMax = Number(config.temp_max);
+            if (!isNaN(tempAtual) && tempAtual > (tMax + TEMP_TOLERANCE)) {
+                problemasDetectados.push(`temperatura alta (${tempAtual.toFixed(1)}°C > ${tMax}°C)`);
+            }
+        }
+
+        // Verificação Piso (Mínimo)
+        if (config.temp_min !== null) {
+            const tMin = Number(config.temp_min);
+            if (!isNaN(tempAtual) && tempAtual < (tMin - TEMP_TOLERANCE)) {
+                problemasDetectados.push(`temperatura baixa (${tempAtual.toFixed(1)}°C < ${tMin}°C)`);
+            }
         }
     }
 
-    // 2. ANÁLISE DE PORTA (Prioridade Imediata após timer interno)
+    // 2. ANÁLISE DE UMIDADE (Min/Max)
+    if (leituraAtual.humidity !== undefined) {
+        const humAtual = Number(leituraAtual.humidity);
+
+        // Verificação Teto (Máximo)
+        if (config.hum_max !== null) {
+            const hMax = Number(config.hum_max);
+            if (!isNaN(humAtual) && humAtual > (hMax + HUM_TOLERANCE)) {
+                problemasDetectados.push(`umidade alta (${humAtual.toFixed(0)}% > ${hMax}%)`);
+            }
+        }
+
+        // Verificação Piso (Mínimo)
+        if (config.hum_min !== null) {
+            const hMin = Number(config.hum_min);
+            if (!isNaN(humAtual) && humAtual < (hMin - HUM_TOLERANCE)) {
+                problemasDetectados.push(`umidade baixa (${humAtual.toFixed(0)}% < ${hMin}%)`);
+            }
+        }
+    }
+
+    // 3. ANÁLISE DE PORTA (Prioridade Imediata após timer interno)
     if (leituraAtual.alarm !== undefined) {
         const isOpen = leituraAtual.alarm > 0;
         if (isOpen) {
@@ -143,9 +178,6 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
             if (tempoAberto > DOOR_TIME_LIMIT) {
                  const minutos = Math.floor(tempoAberto / 60000);
                  problemasDetectados.push(`porta aberta há ${minutos} minutos`);
-                 
-                 // Porta aberta por muito tempo é crítico e já tem seu próprio timer.
-                 // Não precisamos esperar mais 5 min na watchlist.
                  furarFilaWatchlist = true; 
             }
         } else {
@@ -153,7 +185,7 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
         }
     }
 
-    // 3. GERENCIAMENTO DA WATCHLIST (LISTA DE ESPERA)
+    // 4. GERENCIAMENTO DA WATCHLIST (LISTA DE ESPERA)
     
     // Se não há problemas, remove da lista e sai
     if (problemasDetectados.length === 0) {
@@ -166,14 +198,14 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
 
     const now = Date.now();
 
-    // Se NÃO for um alerta de porta (que fura fila), aplicamos a lógica de espera
+    // Se NÃO for um alerta de porta crítico, aplicamos a lógica de espera
     if (!furarFilaWatchlist) {
         let watchEntry = alertWatchlist.get(sensorMac);
 
         if (!watchEntry) {
-            // Primeira vez detectando temperatura alta
+            // Primeira vez detectando anomalia ambiental
             alertWatchlist.set(sensorMac, { first_seen: now });
-            logger.info(`🟡 [WATCHLIST] ${nome} entrou em observação (Temp Alta). Aguardando confirmação...`);
+            logger.info(`🟡 [WATCHLIST] ${nome} entrou em observação. Aguardando confirmação...`);
             return null; // Interrompe aqui. Não alerta ainda.
         } else {
             // Já estava na lista. Verifica há quanto tempo.
@@ -184,14 +216,12 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
             }
         }
     }
-    // Se furarFilaWatchlist == true, ele pula o bloco acima e vai direto para o envio.
 
-    // 4. VERIFICAÇÃO DE COOLDOWN (ENVIO)
-    // Evita enviar mensagens repetidas a cada segundo
+    // 5. VERIFICAÇÃO DE COOLDOWN (ENVIO)
     const lastAlert = alertControl.get(sensorMac)?.last_alert_ts || 0;
     
     if (now - lastAlert < ALERT_COOLDOWN) {
-        return null; // Já enviamos alerta recentemente (nos últimos 20 min)
+        return null; // Já enviamos alerta recentemente
     }
 
     // Passou por todos os filtros. Vamos alertar.
@@ -204,9 +234,14 @@ const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
             sensor: nome,
             temp: leituraAtual.temp,
             hum: leituraAtual.humidity,
-            limite_temp: config.temp_max,
-            limite_tolerancia: (config.temp_max + TEMP_TOLERANCE),
-            tipo_alerta: furarFilaWatchlist ? 'CRITICO_PORTA' : 'CONFIRMADO_TEMP'
+            // Enviamos os limites configurados para referência no N8N
+            limites: {
+                temp_max: config.temp_max,
+                temp_min: config.temp_min,
+                hum_max: config.hum_max,
+                hum_min: config.hum_min
+            },
+            tipo_alerta: furarFilaWatchlist ? 'CRITICO_PORTA' : 'CONFIRMADO_AMBIENTE'
         }
     };
 };

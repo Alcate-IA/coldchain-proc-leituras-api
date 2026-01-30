@@ -1,0 +1,7 @@
+[08:04:08] ERROR | ❌ [GATEWAY SYNC] Erro: TypeError: fetch failed
+[08:04:08] ERROR | ❌ [CACHE] Erro Sensores: TypeError: fetch failed
+[08:14:08] ERROR | ❌ [CACHE] Erro Sensores: TypeError: fetch failed
+[08:19:08] ERROR | ❌ [N8N] Falha: fetch failed
+[08:24:08] ERROR | ❌ [CACHE] Erro Sensores: TypeError: fetch failed
+[08:34:08] ERROR | ❌ [GATEWAY SYNC] Erro: TypeError: fetch failed
+[08:34:08] ERROR | ❌ [CACHE] Erro Sensores: TypeError: fetch failed

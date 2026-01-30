@@ -4,370 +4,563 @@ import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import winston from 'winston';
+import moment from 'moment-timezone';
+import * as ss from 'simple-statistics';
 
 dotenv.config();
 
-// --- CONFIGURAÇÃO DO LOGGER (WINSTON) ---
+const TIMEZONE_CONFIG = 'America/Sao_Paulo';
+
+// ============================================================================
+// 1. CONSTANTES E TUNING
+// ============================================================================
+
+const HARDCODED_BLOCKLIST = [
+    'BC:57:29:1E:2F:2C', 
+];
+
+// Limites Globais (Fallback)
+const ENV_TEMP_MAX_NORMAL = Number(process.env.GLOBAL_TEMP_MAX) || -5.0; 
+const ENV_TEMP_MIN_GLOBAL = Number(process.env.GLOBAL_TEMP_MIN) || -30.0;
+
+// Modo Alto Fluxo
+const ENV_TEMP_MAX_HIGH_TRAFFIC = -2.0; 
+const DAYS_HIGH_TRAFFIC = [3, 4]; 
+
+// Configurações
+const DB_FLUSH_INTERVAL_MS = 10000; 
+const DB_MIN_VAR_TEMP = 0.2;        
+const DB_MIN_VAR_HUM = 2.0;         
+const DB_HEARTBEAT_MS = 10 * 60 * 1000; 
+
+// --- IA & PORTA VIRTUAL (ALTA SENSIBILIDADE) ---
+const PREDICT_WINDOW_MINS = 30;      
+const DATA_SAMPLE_INTERVAL_SEC = 10; 
+const MIN_DATA_POINTS = 30;          
+const PREDICT_WARN_THRESHOLD = 60;   
+
+// *** ZONA DE TUNING FÍSICO (AJUSTADO PARA SENSIBILIDADE EXTREMA) ***
+const VDOOR_RISE_THRESHOLD = 1.8;   // Delta bruto: Agora pega variação de 1.8°C (ex: -19 para -17.2)
+const VDOOR_OPEN_SLOPE = 0.9;       // Slope: Reduzido de 2.0 para 0.9 (Sobe quase 1°C/min = Porta)
+const FAST_CLOSE_SLOPE = -0.15;     // Fast Close: Reduzido de -0.3 para -0.15 (Fechamento mais responsivo)
+
+const DEFROST_MIN_SLOPE = 0.25;     // Mínimo para Degelo
+const DEFROST_MAX_SLOPE = 0.85;     // Máximo Degelo (Acima de 0.85 entra na zona de Porta)
+const DEFROST_EXIT_SLOPE = -0.4;    // Saída de Degelo
+
+const VDOOR_WINDOW_MINS = 5;      
+const VDOOR_COOLDOWN = 20 * 60 * 1000; 
+
+// Alerting
+const BATCH_ALERT_INTERVAL_MS = 5 * 60 * 1000; 
+const ALERT_SOAK_TIME_MS = 10 * 60 * 1000;      
+const CALL_PERSISTENCE_MS = 30 * 60 * 1000;     
+const EXTREME_DEVIATION_C = 10.0;               
+const GATEWAY_TIMEOUT_MS = 15 * 60 * 1000; 
+const GATEWAY_CHECK_INTERVAL_MS = 60 * 1000; 
+
+// ============================================================================
+// 2. LOGGER
+// ============================================================================
 const logger = winston.createLogger({
-    level: 'info',
+    level: process.env.LOG_LEVEL || 'info',
     format: winston.format.combine(
-        winston.format.timestamp({ format: 'HH:mm:ss' }),
-        winston.format.printf(({ timestamp, level, message }) => {
-            return `[${timestamp}] ${level.toUpperCase()}: ${message}`;
-        })
+        winston.format.timestamp({ format: () => moment().tz(TIMEZONE_CONFIG).format('HH:mm:ss') }),
+        winston.format.printf(({ timestamp, level, message }) => `[${timestamp}] ${level.toUpperCase().padEnd(5)} | ${message}`)
     ),
     transports: [
-        new winston.transports.File({ filename: 'logs/error.log', level: 'error', format: winston.format.json() }),
-        new winston.transports.File({ filename: 'logs/combined.log', format: winston.format.json() }),
-        new winston.transports.Console({
-            format: winston.format.combine(
-                winston.format.colorize(),
-                winston.format.printf(({ timestamp, level, message }) => {
-                    return `[${timestamp}] ${level}: ${message}`;
-                })
-            ),
-        })
+        new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+        new winston.transports.Console({ format: winston.format.colorize({ all: true }) })
     ],
 });
 
-// --- CONSTANTES E CONFIGURAÇÕES ---
-const PORT = process.env.PORT || 3030;
-const BROKER_URL = 'mqtt://broker.hivemq.com';
-const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';
+// ============================================================================
+// 3. ESTADO EM MEMÓRIA
+// ============================================================================
+const lastReadings = new Map();   
+const alertControl = new Map();   
+const sensorHistory = new Map();  
+const alertWatchlist = new Map(); 
+const gatewayHeartbeats = new Map(); 
 
-// Filtros de Gravação (DB)
-const DOOR_DEBOUNCE_MS = 5000;      // 5s para gravar alteração de porta
-const ANALOG_MAX_AGE_MS = 300000;   // 5min heartbeat gravação
-const VAR_TEMP_MIN = 0.5;           // Variação min Temp para gravar no DB
-const VAR_HUM_MIN = 1.0;            // Variação min Hum para gravar no DB
+let configCache = new Map();      
+let secondarySensorsBlocklist = new Set(); 
 
-// --- REGRAS DE ALERTA E LISTA DE ACOMPANHAMENTO ---
-const WATCHLIST_DELAY_MS = 5 * 60 * 1000; // 5 Min: Tempo de persistência para Temp/Hum
-const ALERT_COOLDOWN = 20 * 60 * 1000;    // 20 Min: Silêncio após enviar alerta
-const DOOR_TIME_LIMIT = 5 * 60 * 1000;    // 5 Min: Tempo para considerar porta aberta erro
+let dbTelemetryBuffer = [];
+let dbDoorBuffer = []; 
+let n8nAlertBuffer = [];
 
-// Tolerâncias para evitar "flapping" (alerta falso por oscilação pequena)
-const TEMP_TOLERANCE = 1.0;               // 1.0°C
-const HUM_TOLERANCE = 2.0;                // 2.0%
-
-// Feature Flags
-const PROCESS_GPS    = process.env.ENABLE_GPS_DATA === 'true';
-const PROCESS_DOORS  = process.env.ENABLE_DOORS === 'true';
-
-// --- ESTADO EM MEMÓRIA ---
-const lastReadings = new Map();
-const alertControl = new Map();     // Controla o Cooldown de envio
-const alertWatchlist = new Map();   // Controla a Lista de Observação
-let configCache = new Map();
-
-// --- INICIALIZAÇÃO ---
+// ============================================================================
+// 4. INFRAESTRUTURA
+// ============================================================================
 const app = express();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const client = mqtt.connect(BROKER_URL, {
-    clientId: 'alcateia_vps_' + Math.random().toString(16).substring(2, 10),
+const client = mqtt.connect(process.env.MQTT_BROKER_URL || 'mqtt://broker.hivemq.com', {
+    clientId: 'alcateia_sensitive_v4_' + Math.random().toString(16).substring(2, 8),
     clean: true,
     reconnectPeriod: 5000
 });
 
-app.use(cors());
+const TOPIC_DATA = '/alcateia/gateways/beacons/prd_ble_dat';
+
 app.use(express.json());
+app.use(cors());
 
-// --- FUNÇÕES AUXILIARES ---
-const formatarMac = (mac) => mac?.includes(':') ? mac : mac?.replace(/(.{2})(?=.)/g, '$1:');
+app.get('/health', (req, res) => {
+    const now = Date.now();
+    const sensorsDetail = [];
+    
+    configCache.forEach((config, mac) => {
+        const reading = lastReadings.get(mac);
+        const ctrl = alertControl.get(mac);
+        const hasData = reading && reading.ts > 0;
 
-const calcularBateria = (mVolts) => {
-    if (!mVolts) return 0;
-    const [MAX, MIN] = [3600, 2500];
-    return Math.max(0, Math.min(100, Math.round(((mVolts - MIN) / (MAX - MIN)) * 100)));
-};
+        let statusGeral = 'OK 🟢';
+        if (ctrl?.is_defrosting) statusGeral = 'DEGELO ❄️';
+        else if (ctrl?.last_virtual_state) statusGeral = 'PORTA ABERTA 🔓';
+        
+        sensorsDetail.push({
+            nome: config.display_name || mac,
+            temp: hasData ? reading.db_temp : 'N/A',
+            status: statusGeral,
+            seen_ago: hasData ? Math.floor((now - reading.ts) / 1000) + 's' : '-'
+        });
+    });
 
-// --- GESTÃO DE CACHE ---
-const atualizarCacheConfiguracoes = async () => {
-    try {
-        // Busca configurações incluindo os novos campos Min/Max
-        const { data: configs, error } = await supabase
-            .from('sensor_configs')
-            .select('mac, temp_max, temp_min, hum_max, hum_min, display_name')
-            .eq('em_manutencao', false);
+    sensorsDetail.sort((a, b) => a.nome.localeCompare(b.nome));
 
-        if (error) throw error;
-
-        const novoCache = new Map();
-        configs.forEach(c => novoCache.set(c.mac, c));
-        configCache = novoCache;
-        logger.info(`🔄 [CACHE] Configurações atualizadas: ${configCache.size} sensores ativos.`);
-    } catch (e) {
-        logger.error(`❌ [CACHE] Erro ao atualizar: ${e.message}`);
-    }
-};
-
-// Atualiza cache ao iniciar e a cada 10 min
-setTimeout(atualizarCacheConfiguracoes, 1000);
-setInterval(atualizarCacheConfiguracoes, 10 * 60 * 1000);
-
-// Rota Manual
-app.all('/api/refresh-config', async (req, res) => {
-    await atualizarCacheConfiguracoes();
-    res.json({ success: true, message: 'Cache atualizado.' });
+    res.json({
+        status: 'UP',
+        uptime: process.uptime().toFixed(0) + 's',
+        total_sensors: configCache.size,
+        sensors: sensorsDetail
+    });
 });
 
-// --- LÓGICA CORE: VERIFICAÇÃO HÍBRIDA ---
-const verificarSensorIndividual = (sensorMac, leituraAtual, estadoMemoria) => {
-    const config = configCache.get(sensorMac);
-    if (!config) return null; 
+// ============================================================================
+// 5. CACHE E SYNC
+// ============================================================================
+const formatarMac = (mac) => mac?.includes(':') ? mac : mac?.replace(/(.{2})(?=.)/g, '$1:');
 
-    const nome = config.display_name || sensorMac;
-    let problemasDetectados = [];
-    
-    // Flag: Se for true, ignora o tempo de espera da watchlist e alerta logo (ex: porta aberta a muito tempo)
-    let furarFilaWatchlist = false; 
+const calcularBateria = (mV) => {
+    if (!mV) return 0;
+    return Math.min(100, Math.max(0, Math.round(((mV - 2500) / (3600 - 2500)) * 100)));
+};
 
-    // 1. ANÁLISE DE TEMPERATURA (Min/Max)
-    if (leituraAtual.temp !== undefined) {
-        const tempAtual = Number(leituraAtual.temp);
+const atualizarCacheSensores = async () => {
+    try {
+        const { data: configs, error } = await supabase
+            .from('sensor_configs')
+            .select('mac, sensor_porta_vinculado, display_name, temp_max, temp_min, hum_max, hum_min, em_manutencao'); 
+
+        if (error) throw error;
         
-        // Verificação Teto (Máximo)
-        if (config.temp_max !== null) {
-            const tMax = Number(config.temp_max);
-            if (!isNaN(tempAtual) && tempAtual > (tMax + TEMP_TOLERANCE)) {
-                problemasDetectados.push(`temperatura alta (${tempAtual.toFixed(1)}°C > ${tMax}°C)`);
+        const novoCache = new Map();
+        const novaBlocklist = new Set(); 
+
+        configs.forEach(c => {
+            const macFormatted = formatarMac(c.mac);
+            if (macFormatted) novoCache.set(macFormatted, c);
+            if (c.sensor_porta_vinculado && c.sensor_porta_vinculado.length > 5) {
+                novaBlocklist.add(formatarMac(c.sensor_porta_vinculado));
             }
-        }
+        });
+        
+        configCache = novoCache;
+        secondarySensorsBlocklist = novaBlocklist;
+        if (process.env.LOG_LEVEL === 'debug') logger.info(`🔄 [CACHE] ${configCache.size} sensores.`);
+    } catch (e) { logger.error(`❌ [CACHE] Erro: ${e.message}`); }
+};
 
-        // Verificação Piso (Mínimo)
-        if (config.temp_min !== null) {
-            const tMin = Number(config.temp_min);
-            if (!isNaN(tempAtual) && tempAtual < (tMin - TEMP_TOLERANCE)) {
-                problemasDetectados.push(`temperatura baixa (${tempAtual.toFixed(1)}°C < ${tMin}°C)`);
+const sincronizarGatewaysConhecidos = async () => {
+    try {
+        const ontem = moment().subtract(24, 'hours').toISOString();
+        const { data, error } = await supabase
+            .from('telemetry_logs')
+            .select('gw, ts').gte('ts', ontem).order('ts', { ascending: false }).limit(2000); 
+        if (error) throw error;
+        data.forEach(log => {
+            const gwMac = formatarMac(log.gw);
+            if (gwMac && !gatewayHeartbeats.has(gwMac)) {
+                gatewayHeartbeats.set(gwMac, { last_seen: new Date(log.ts).getTime(), source: 'DB' });
             }
-        }
-    }
+        });
+    } catch (e) { logger.error(`❌ [GW SYNC] Erro: ${e.message}`); }
+};
 
-    // 2. ANÁLISE DE UMIDADE (Min/Max)
-    if (leituraAtual.humidity !== undefined) {
-        const humAtual = Number(leituraAtual.humidity);
+setTimeout(() => { atualizarCacheSensores(); sincronizarGatewaysConhecidos(); }, 1000);
+setInterval(atualizarCacheSensores, 10 * 60 * 1000);
+setInterval(sincronizarGatewaysConhecidos, 30 * 60 * 1000);
 
-        // Verificação Teto (Máximo)
-        if (config.hum_max !== null) {
-            const hMax = Number(config.hum_max);
-            if (!isNaN(humAtual) && humAtual > (hMax + HUM_TOLERANCE)) {
-                problemasDetectados.push(`umidade alta (${humAtual.toFixed(0)}% > ${hMax}%)`);
-            }
-        }
-
-        // Verificação Piso (Mínimo)
-        if (config.hum_min !== null) {
-            const hMin = Number(config.hum_min);
-            if (!isNaN(humAtual) && humAtual < (hMin - HUM_TOLERANCE)) {
-                problemasDetectados.push(`umidade baixa (${humAtual.toFixed(0)}% < ${hMin}%)`);
-            }
-        }
-    }
-
-    // 3. ANÁLISE DE PORTA (Prioridade Imediata após timer interno)
-    if (leituraAtual.alarm !== undefined) {
-        const isOpen = leituraAtual.alarm > 0;
-        if (isOpen) {
-            // Se abriu agora, marca o tempo
-            if (!estadoMemoria.open_since) estadoMemoria.open_since = Date.now();
-            
-            const tempoAberto = Date.now() - estadoMemoria.open_since;
-
-            // Se estourou o tempo limite da porta (ex: 5 min)
-            if (tempoAberto > DOOR_TIME_LIMIT) {
-                 const minutos = Math.floor(tempoAberto / 60000);
-                 problemasDetectados.push(`porta aberta há ${minutos} minutos`);
-                 furarFilaWatchlist = true; 
-            }
-        } else {
-            estadoMemoria.open_since = null;
-        }
-    }
-
-    // 4. GERENCIAMENTO DA WATCHLIST (LISTA DE ESPERA)
+// ============================================================================
+// 6. INTELIGÊNCIA TÉRMICA (COM FAST SLOPE)
+// ============================================================================
+const analisarTendencia = (mac, tempAtual, tempMax) => {
+    const now = Date.now();
+    let history = sensorHistory.get(mac) || [];
+    const lastEntry = history[history.length - 1];
     
-    // Se não há problemas, remove da lista e sai
-    if (problemasDetectados.length === 0) {
+    if (!lastEntry || (now - lastEntry.ts >= DATA_SAMPLE_INTERVAL_SEC * 1000)) {
+        history.push({ ts: now, temp: tempAtual });
+        const windowStart = now - (PREDICT_WINDOW_MINS * 60 * 1000);
+        history = history.filter(h => h.ts > windowStart);
+        sensorHistory.set(mac, history);
+    }
+
+    if (history.length < MIN_DATA_POINTS) return { ready: false, count: history.length };
+
+    // 1. Slope Padrão (30 min window)
+    const startTime = history[0].ts;
+    const dataPoints = history.map(h => [ (h.ts - startTime) / 60000, h.temp ]);
+    const { m, b } = ss.linearRegression(dataPoints);
+
+    // 2. Fast Slope (Últimos 5 pontos)
+    let fastSlope = m; 
+    const FAST_WINDOW = 5;
+    if (history.length >= FAST_WINDOW) {
+        const recentHistory = history.slice(-FAST_WINDOW);
+        const startFast = recentHistory[0].ts;
+        const fastPoints = recentHistory.map(h => [ (h.ts - startFast) / 60000, h.temp ]);
+        const fastRegression = ss.linearRegression(fastPoints);
+        fastSlope = fastRegression.m;
+    }
+
+    const soma = history.reduce((acc, item) => acc + item.temp, 0);
+    const media = Number((soma / history.length).toFixed(2));
+
+    let previsaoDetalhada = null;
+    if (tempMax !== null && m > 0.1) {
+        const minutosFuturos = (tempMax - b) / m;
+        const minutosPassados = (now - startTime) / 60000;
+        const minutosRestantes = minutosFuturos - minutosPassados;
+        if (minutosRestantes > 0 && minutosRestantes < PREDICT_WARN_THRESHOLD) {
+            previsaoDetalhada = { tempo_restante: Math.floor(minutosRestantes), velocidade: Number(m.toFixed(2)) };
+        }
+    }
+    
+    return { ready: true, slope: m, fast_slope: fastSlope, avg: media, previsao: previsaoDetalhada };
+};
+
+const analisarPortaVirtual = (mac, tempAtual) => {
+    let history = sensorHistory.get(mac) || [];
+    if (history.length < 3) return null;
+    const now = Date.now();
+    const windowStart = now - (VDOOR_WINDOW_MINS * 60 * 1000);
+    const pastReading = history.find(h => h.ts >= windowStart);
+    if (!pastReading) return null;
+    
+    // Comparação de Delta absoluto
+    const deltaTemp = tempAtual - pastReading.temp;
+    
+    // Usa o novo limiar mais sensível (1.8°C)
+    if (deltaTemp >= VDOOR_RISE_THRESHOLD) {
+        return { detectado: true, delta: deltaTemp.toFixed(1) };
+    }
+    return null;
+};
+
+// ============================================================================
+// 7. ANÁLISE DE ALERTAS (TUNING SENSÍVEL)
+// ============================================================================
+const verificarSensor = (sensorMac, leitura, gatewayMac) => {
+    const config = configCache.get(sensorMac);
+    const nome = config.display_name || sensorMac;
+    const now = Date.now();
+    
+    if (config.em_manutencao) {
+        if (alertWatchlist.has(sensorMac)) alertWatchlist.delete(sensorMac);
+        if (alertControl.has(sensorMac)) alertControl.delete(sensorMac);
+        return null;
+    }
+
+    const ctrl = alertControl.get(sensorMac) || {};
+    const lastState = ctrl.last_virtual_state === true;
+    let isDefrosting = ctrl.is_defrosting === true; 
+
+    // Limites
+    const diaHoje = moment(now).tz(TIMEZONE_CONFIG).day();
+    const isAltoFluxo = DAYS_HIGH_TRAFFIC.includes(diaHoje);
+    const LIMIT_TEMP_MAX = config.temp_max !== null ? config.temp_max : (isAltoFluxo ? ENV_TEMP_MAX_HIGH_TRAFFIC : ENV_TEMP_MAX_NORMAL);
+    const LIMIT_TEMP_MIN = config.temp_min !== null ? config.temp_min : ENV_TEMP_MIN_GLOBAL;
+    const LIMIT_HUM_MAX = config.hum_max;
+    const LIMIT_HUM_MIN = config.hum_min;
+
+    let mensagemProblema = null;
+    let prioridade = 'ALTA';
+    let dadosPrevisao = null;
+    let desvioExtremo = false;
+
+    if (leitura.temp !== undefined) {
+        const val = Number(leitura.temp);
+        const iaStats = analisarTendencia(sensorMac, val, LIMIT_TEMP_MAX);
+
+        if (iaStats.ready) {
+            // --- DETECÇÃO DE DEGELO (SEPARAÇÃO DO RUÍDO) ---
+            if (!isDefrosting && !lastState) {
+                // Slope moderado (0.25 a 0.85) é degelo. Acima de 0.9 é porta.
+                if (iaStats.slope >= DEFROST_MIN_SLOPE && iaStats.slope <= DEFROST_MAX_SLOPE) {
+                    if (val > (iaStats.avg + 0.5)) isDefrosting = true;
+                }
+            }
+            if (isDefrosting) {
+                if (iaStats.slope < DEFROST_EXIT_SLOPE) isDefrosting = false;
+            }
+            ctrl.is_defrosting = isDefrosting;
+
+            // =================================================================
+            // LÓGICA DE PORTA VIRTUAL
+            // =================================================================
+            let currentState = lastState;
+            
+            if (!isDefrosting) { 
+                if (lastState === true) {
+                    // FECHAMENTO: Se o slope cair levemente (-0.05) OU cair rápido (-0.15), fecha.
+                    if (iaStats.slope < -0.05 || iaStats.fast_slope < FAST_CLOSE_SLOPE) {
+                        currentState = false; 
+                    }
+                } else {
+                    // ABERTURA: Verifica Delta (> 1.8°C) OU Slope Rápido (> 0.9)
+                    const vDoor = analisarPortaVirtual(sensorMac, val);
+                    if ((vDoor && vDoor.detectado) || iaStats.slope > VDOOR_OPEN_SLOPE) {
+                        currentState = true;
+                    }
+                }
+            } else {
+                currentState = false; // Degelo não é porta aberta
+            }
+
+            if (currentState !== ctrl.last_virtual_state) {
+                const acao = currentState ? 'ABRIU 🔓' : 'FECHOU 🔒';
+                logger.info(`🔄 [ESTADO] ${nome}: ${acao} (Slope: ${iaStats.slope.toFixed(2)} | Fast: ${iaStats.fast_slope.toFixed(2)})`);
+                dbDoorBuffer.push({
+                    gateway_mac: gatewayMac || "GW-UNKNOWN",
+                    sensor_mac: sensorMac, 
+                    timestamp_read: new Date().toISOString(),
+                    is_open: currentState,
+                    alarm_code: currentState ? 1 : 0,
+                    battery_percent: calcularBateria(leitura.vbatt),
+                    rssi: leitura.rssi 
+                });
+            } else {
+                let icon = currentState ? '🔓' : '🔒';
+                if (isDefrosting) icon = '❄️'; 
+                logger.info(`🔍 [ANÁLISE] ${nome.padEnd(20)} | Atual: ${val}°C | Média: ${iaStats.avg}°C | Status: ${icon} (S: ${iaStats.slope.toFixed(2)} / F: ${iaStats.fast_slope.toFixed(2)})`);
+            }
+            
+            ctrl.last_virtual_state = currentState;
+            alertControl.set(sensorMac, ctrl);
+
+            // --- ALERTAS DE TEMPERATURA ---
+            const tolerance = isDefrosting ? 15.0 : 0.0;
+
+            if (val < LIMIT_TEMP_MIN) {
+                mensagemProblema = `Temp BAIXA: ${val}°C (Min: ${LIMIT_TEMP_MIN}°C)`;
+                if (val < (LIMIT_TEMP_MIN - EXTREME_DEVIATION_C)) desvioExtremo = true;
+            } 
+            else if (val > (LIMIT_TEMP_MAX + tolerance)) {
+                mensagemProblema = `Temp ALTA: ${val}°C (Max: ${LIMIT_TEMP_MAX}°C)`;
+                if (val > (LIMIT_TEMP_MAX + EXTREME_DEVIATION_C)) desvioExtremo = true;
+            } 
+            else if (iaStats.previsao && !isDefrosting) {
+                mensagemProblema = `TENDÊNCIA: Atingirá limite em ${iaStats.previsao.tempo_restante}min`;
+                prioridade = 'PREDITIVA';
+                dadosPrevisao = { ...iaStats.previsao };
+            }
+
+        } else {
+            logger.info(`⏳ [CALIBRANDO] ${nome.padEnd(20)} | ${iaStats.count}/${MIN_DATA_POINTS}`);
+        }
+    }
+
+    if (!mensagemProblema && leitura.humidity !== undefined) {
+        const valHum = Number(leitura.humidity);
+        if (LIMIT_HUM_MAX && valHum > LIMIT_HUM_MAX) mensagemProblema = `Umid ALTA: ${valHum}%`;
+        else if (LIMIT_HUM_MIN && valHum < LIMIT_HUM_MIN) mensagemProblema = `Umid BAIXA: ${valHum}%`;
+    }
+
+    if (!mensagemProblema) {
         if (alertWatchlist.has(sensorMac)) {
-            logger.info(`🟢 [WATCHLIST] Sensor ${nome} normalizou. Removido da observação.`);
+            logger.info(`💚 [NORMALIZOU] ${nome} voltou para o range.`);
             alertWatchlist.delete(sensorMac);
         }
         return null;
     }
 
-    const now = Date.now();
+    const entry = alertWatchlist.get(sensorMac);
+    if (!entry) {
+        alertWatchlist.set(sensorMac, { first_seen: now, msg: mensagemProblema });
+        logger.info(`👀 [WATCHLIST] ${nome} fora do range. Observando...`);
+        return null;
+    } else {
+        const tempoDecorrido = now - entry.first_seen;
+        if (tempoDecorrido < ALERT_SOAK_TIME_MS) return null;
+        
+        const iaStats = sensorHistory.get(sensorMac) ? analisarTendencia(sensorMac, Number(leitura.temp || 0), LIMIT_TEMP_MAX) : { slope: 0 };
+        const isGradual = Math.abs(iaStats.slope) < 1.0; 
 
-    // Se NÃO for um alerta de porta crítico, aplicamos a lógica de espera
-    if (!furarFilaWatchlist) {
-        let watchEntry = alertWatchlist.get(sensorMac);
-
-        if (!watchEntry) {
-            // Primeira vez detectando anomalia ambiental
-            alertWatchlist.set(sensorMac, { first_seen: now });
-            logger.info(`🟡 [WATCHLIST] ${nome} entrou em observação. Aguardando confirmação...`);
-            return null; // Interrompe aqui. Não alerta ainda.
+        if (tempoDecorrido > CALL_PERSISTENCE_MS && desvioExtremo && isGradual) {
+            prioridade = 'CRITICA'; 
         } else {
-            // Já estava na lista. Verifica há quanto tempo.
-            const tempoEmObservacao = now - watchEntry.first_seen;
-            if (tempoEmObservacao < WATCHLIST_DELAY_MS) {
-                // Ainda não passou os 5 minutos de confirmação
-                return null; 
-            }
+            prioridade = 'ALTA';    
+        }
+
+        const lastSent = ctrl.last_alert_sent_ts || 0;
+        const cooldownEnvio = prioridade === 'PREDITIVA' ? 45*60000 : 15*60000;
+
+        if (now - lastSent > cooldownEnvio) {
+            ctrl.last_alert_sent_ts = now;
+            alertControl.set(sensorMac, ctrl);
+            return {
+                sensor_nome: nome,
+                sensor_mac: sensorMac,
+                prioridade: prioridade,
+                mensagens: [mensagemProblema],
+                timestamp_iso: moment(now).tz(TIMEZONE_CONFIG).format(),
+                dados_contexto: {
+                    temp_atual: leitura.temp,
+                    previsao: dadosPrevisao,
+                    limites: { max: LIMIT_TEMP_MAX, min: LIMIT_TEMP_MIN },
+                    status_operacional: isDefrosting ? "EM_DEGELO" : "NORMAL"
+                }
+            };
         }
     }
-
-    // 5. VERIFICAÇÃO DE COOLDOWN (ENVIO)
-    const lastAlert = alertControl.get(sensorMac)?.last_alert_ts || 0;
-    
-    if (now - lastAlert < ALERT_COOLDOWN) {
-        return null; // Já enviamos alerta recentemente
-    }
-
-    // Passou por todos os filtros. Vamos alertar.
-    alertControl.set(sensorMac, { last_alert_ts: now });
-
-    return {
-        sensor_nome: nome,
-        descricao_problemas: problemasDetectados,
-        dados_brutos: {
-            sensor: nome,
-            temp: leituraAtual.temp,
-            hum: leituraAtual.humidity,
-            // Enviamos os limites configurados para referência no N8N
-            limites: {
-                temp_max: config.temp_max,
-                temp_min: config.temp_min,
-                hum_max: config.hum_max,
-                hum_min: config.hum_min
-            },
-            tipo_alerta: furarFilaWatchlist ? 'CRITICO_PORTA' : 'CONFIRMADO_AMBIENTE'
-        }
-    };
+    return null;
 };
 
-// --- EVENTOS MQTT ---
+// ============================================================================
+// 8. TAREFAS DE FUNDO
+// ============================================================================
 
-client.on('connect', () => {
-    logger.info(`✅ [MQTT] Conectado! ID: ${client.options.clientId}`);
-    client.subscribe(TOPIC_DATA, (err) => {
-        if (!err) logger.info(`📡 [MQTT] Inscrito: ${TOPIC_DATA}`);
-        else logger.error(`❌ [MQTT] Erro inscrição: ${err.message}`);
+setInterval(async () => {
+    if (dbTelemetryBuffer.length > 0) {
+        const batch = [...dbTelemetryBuffer];
+        dbTelemetryBuffer = [];
+        await supabase.from('telemetry_logs').insert(batch);
+        logger.info(`💾 [DB] Salvos ${batch.length} logs de telemetria.`);
+    }
+    if (dbDoorBuffer.length > 0) {
+        const batch = [...dbDoorBuffer];
+        dbDoorBuffer = [];
+        await supabase.from('door_logs').insert(batch);
+        logger.info(`💾 [DB] Salvos ${batch.length} logs de porta virtual.`);
+    }
+}, DB_FLUSH_INTERVAL_MS);
+
+setInterval(async () => {
+    if (n8nAlertBuffer.length === 0) return;
+    logger.info(`📦 [N8N] Enviando ${n8nAlertBuffer.length} alertas acumulados...`);
+    const payload = [...n8nAlertBuffer];
+    n8nAlertBuffer = [];
+    try {
+        await fetch('https://n8n.alcateia-ia.com/webhook/coldchain/alertas', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ timestamp: new Date().toISOString(), total_alertas: payload.length, is_batched: true, alertas: payload })
+        });
+        logger.info(`✅ [N8N] Sucesso.`);
+    } catch (e) { logger.error(`❌ [N8N] Falha: ${e.message}`); }
+}, BATCH_ALERT_INTERVAL_MS);
+
+setInterval(() => {
+    const now = Date.now();
+    gatewayHeartbeats.forEach((data, gmac) => {
+        const lastAlert = alertControl.get(gmac)?.last_alert_ts || 0;
+        if (now - lastAlert < 60 * 60 * 1000) return; 
+        if (now - data.last_seen > GATEWAY_TIMEOUT_MS) {
+            if (HARDCODED_BLOCKLIST.includes(gmac)) return;
+            const minOffline = Math.floor((now - data.last_seen) / 60000);
+            n8nAlertBuffer.push({
+                sensor_nome: `GATEWAY ${gmac.slice(-5)}`,
+                sensor_mac: gmac,
+                prioridade: 'SISTEMA',
+                mensagens: [`GATEWAY OFFLINE há ${minOffline} minutos.`],
+                timestamp_iso: moment(now).tz(TIMEZONE_CONFIG).format(),
+                dados_contexto: { tipo: "INFRAESTRUTURA" }
+            });
+            logger.warn(`🔌 [GATEWAY DOWN] ${gmac} offline.`);
+            const currentCtrl = alertControl.get(gmac) || {};
+            currentCtrl.last_alert_ts = now;
+            alertControl.set(gmac, currentCtrl);
+        }
     });
+}, GATEWAY_CHECK_INTERVAL_MS);
+
+setInterval(() => {
+    const now = Date.now();
+    const umDia = 24 * 60 * 60 * 1000;
+    for (const [mac, data] of lastReadings) {
+        if ((now - data.ts) > umDia) {
+            lastReadings.delete(mac);
+            sensorHistory.delete(mac);
+            alertControl.delete(mac);
+        }
+    }
+    for (const [gmac, data] of gatewayHeartbeats) {
+        if ((now - data.last_seen) > (umDia * 2)) gatewayHeartbeats.delete(gmac);
+    }
+}, 24 * 60 * 60 * 1000);
+
+// ============================================================================
+// 9. LOOP MQTT
+// ============================================================================
+client.on('connect', () => {
+    logger.info(`✅ [MQTT] Conectado!`);
+    client.subscribe(TOPIC_DATA);
+    atualizarCacheSensores(); 
+    sincronizarGatewaysConhecidos();
 });
 
-client.on('message', async (topic, message) => {
+client.on('message', (topic, message) => {
     if (topic !== TOPIC_DATA) return;
-
     try {
         const payload = JSON.parse(message.toString());
         const items = Array.isArray(payload) ? payload : [payload];
         const now = Date.now();
-
-        const dbBatchPortas = [];
-        const dbBatchTelemetria = [];
-        const alertasParaEnviar = [];
-
-        items.forEach((item) => {
-            if (item.obj && Array.isArray(item.obj)) {
-                const gwMac = formatarMac(item.gmac);
+        items.forEach(item => {
+            const gatewayMac = formatarMac(item.gmac);
+            if (HARDCODED_BLOCKLIST.includes(gatewayMac)) return; 
+            if (gatewayMac) gatewayHeartbeats.set(gatewayMac, { last_seen: now });
+            if (!item.obj) return;
+            item.obj.forEach(sensor => {
+                const mac = formatarMac(sensor.dmac);
+                if (HARDCODED_BLOCKLIST.includes(mac)) return;
+                if (secondarySensorsBlocklist.has(mac)) return; 
+                const config = configCache.get(mac);
+                if (!config) return; 
                 
-                item.obj.forEach(sensor => {
-                    const sensorMac = formatarMac(sensor.dmac);
-                    const vbatt = calcularBateria(sensor.vbatt);
-                    
-                    // Recupera ou inicializa estado anterior
-                    let last = lastReadings.get(sensorMac) || { temp: 0, hum: 0, state: null, ts: 0, open_since: null };
-                    const timeDiff = now - last.ts;
-
-                    // --- A. PROCESSAMENTO DE ALERTAS ---
-                    const alerta = verificarSensorIndividual(sensorMac, sensor, last);
-                    if (alerta) {
-                        alertasParaEnviar.push(alerta);
+                let last = lastReadings.get(mac) || { ts: 0, db_temp: -999, db_hum: -999, db_ts: 0 };
+                const alerta = verificarSensor(mac, sensor, gatewayMac);
+                if (alerta) {
+                    n8nAlertBuffer.push(alerta);
+                    logger.warn(`⚠️ [ALERTA] ${config.display_name}: ${alerta.mensagens[0]}`);
+                }
+                if (sensor.temp !== undefined) {
+                    const diffTemp = Math.abs(sensor.temp - last.db_temp);
+                    const diffHum = Math.abs((sensor.humidity || 0) - last.db_hum);
+                    if (diffTemp >= DB_MIN_VAR_TEMP || diffHum >= DB_MIN_VAR_HUM || (now - last.db_ts > DB_HEARTBEAT_MS)) {
+                        dbTelemetryBuffer.push({ gw: item.gmac, mac: mac, ts: new Date().toISOString(), temp: sensor.temp, hum: sensor.humidity, batt: calcularBateria(sensor.vbatt), rssi: sensor.rssi });
+                        last.db_temp = sensor.temp;
+                        last.db_hum = sensor.humidity;
+                        last.db_ts = now;
                     }
-
-                    // --- B. PREPARAÇÃO PARA DB (LOGS) ---
-                    // 1. Portas
-                    if (PROCESS_DOORS && sensor.alarm !== undefined) {
-                        const isOpen = sensor.alarm > 0;
-                        if (isOpen !== last.state || timeDiff > DOOR_DEBOUNCE_MS) {
-                            dbBatchPortas.push({
-                                gateway_mac: gwMac, sensor_mac: sensorMac, timestamp_read: new Date().toISOString(),
-                                battery_percent: vbatt, is_open: isOpen, alarm_code: sensor.alarm, rssi: sensor.rssi
-                            });
-                            last.state = isOpen;
-                            last.ts = now;
-                        }
-                    } 
-                    // 2. Telemetria (Temp/Hum/GPS)
-                    else if (PROCESS_GPS && (sensor.temp !== undefined)) {
-                        const diffTemp = Math.abs(sensor.temp - last.temp);
-                        const diffHum = Math.abs((sensor.humidity || 0) - last.hum);
-                        if (diffTemp >= VAR_TEMP_MIN || diffHum >= VAR_HUM_MIN || timeDiff > ANALOG_MAX_AGE_MS) {
-                            dbBatchTelemetria.push({
-                                gw: gwMac, mac: sensorMac, ts: new Date().toISOString(),
-                                batt: vbatt, temp: sensor.temp, hum: sensor.humidity, rssi: sensor.rssi,
-                                latitude: item.location?.latitude, longitude: item.location?.longitude
-                            });
-                            last.temp = sensor.temp;
-                            last.hum = sensor.humidity;
-                            last.ts = now;
-                        }
-                    }
-                    
-                    // Salva estado atualizado
-                    lastReadings.set(sensorMac, last);
-                });
-            }
+                }
+                last.ts = now;
+                lastReadings.set(mac, last);
+            });
         });
-
-        // --- C. ENVIO PARA N8N ---
-        if (alertasParaEnviar.length > 0) {
-            const rawData = alertasParaEnviar.map(a => a.dados_brutos);
-            
-            // Cria texto simples para TTS (Texto para Fala)
-            const frases = alertasParaEnviar.map(a => `No ${a.sensor_nome}, ${a.descricao_problemas.join(' e ')}`);
-            const ttsMessage = `Atenção. Alertas confirmados: ${frases.join('. ')}.`;
-
-            const payloadN8N = {
-                trigger_reason: "validated_alert_report",
-                has_alerts: true,
-                timestamp: new Date().toISOString(),
-                tts_message: ttsMessage,
-                alert_count: alertasParaEnviar.length,
-                raw_data: rawData
-            };
-
-            logger.info(`🚨 [N8N] Enviando ${alertasParaEnviar.length} alertas validados.`);
-
-            fetch('https://n8n.alcateia-ia.com/webhook/coldchain/alertas', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payloadN8N)
-            }).catch(err => logger.error(`❌ [N8N] Falha no envio: ${err.message}`));
-        }
-
-        // --- D. GRAVAÇÃO NO BANCO (ASSÍNCRONA) ---
-        if (dbBatchPortas.length > 0) {
-            supabase.from('door_logs').insert(dbBatchPortas).then(({error}) => {
-                if(error) logger.error(`DB Porta: ${error.message}`);
-            });
-        }
-        if (dbBatchTelemetria.length > 0) {
-            supabase.from('telemetry_logs').insert(dbBatchTelemetria).then(({error}) => {
-                if(error) logger.error(`DB Telemetria: ${error.message}`);
-            });
-        }
-
-    } catch (e) {
-        logger.error(`❌ Erro no Loop Principal: ${e.message}`);
-    }
+    } catch (e) { logger.error(`🔥 Loop Error: ${e.message}`); }
 });
 
-// Logs de conexão
-client.on('reconnect', () => logger.warn('⚠️ [MQTT] Reconectando...'));
-client.on('offline', () => logger.warn('🔌 [MQTT] Offline.'));
-client.on('error', (err) => logger.error(`🔥 [MQTT] Erro: ${err.message}`));
+const shutdown = async () => {
+    logger.info('🛑 Encerrando sistema...');
+    client.end(); 
+    if (dbTelemetryBuffer.length > 0) await supabase.from('telemetry_logs').insert(dbTelemetryBuffer);
+    process.exit(0);
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
-// Inicia servidor Express
-app.listen(PORT, () => logger.info(`🚀 API Online na porta ${PORT}`));
+const PORT = process.env.PORT || 3030;
+app.listen(PORT, () => logger.info(`🚀 Monitor ColdChain Térmico Online na porta ${PORT}`));

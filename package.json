@@ -6,7 +6,6 @@
   "type": "module",
   "scripts": {
     "start": "node index.js"
-    
   },
   "repository": {
     "type": "git",
@@ -20,12 +19,14 @@
   },
   "homepage": "https://github.com/Alcate-IA/coldchain-proc-leituras-api#readme",
   "dependencies": {
-    "@supabase/supabase-js": "^2.90.1",
-    "cors": "^2.8.5",
+    "@supabase/supabase-js": "^2.93.3",
+    "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
+    "moment-timezone": "^0.6.0",
     "mqtt": "^5.14.1",
     "node-cron": "^4.2.1",
+    "simple-statistics": "^7.8.8",
     "winston": "^3.19.0"
   }
 }

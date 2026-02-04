@@ -298,6 +298,78 @@ setInterval(async () => {
 }, DB_FLUSH_INTERVAL_MS);
 
 /**
+ * Valida se um alerta ainda é relevante antes de enviar
+ * Verifica se temperatura está normal e se porta está fechada
+ */
+function validarAlertaAntesEnvio(alerta) {
+    // Alertas de infraestrutura (SISTEMA) sempre são válidos
+    if (alerta.prioridade === 'SISTEMA' || 
+        (alerta.dados_contexto?.tipo === 'INFRAESTRUTURA')) {
+        return true;
+    }
+
+    const mac = alerta.sensor_mac;
+    const state = sensorService.getSensorState(mac);
+    const config = configCache.get(mac);
+
+    // Se não encontrar estado ou config, mantém o alerta (pode ser legítimo)
+    if (!state || !config) {
+        return true;
+    }
+
+    const now = Date.now();
+    const tempAtual = state.lastReading.db_temp;
+
+    // Verifica se é alerta de temperatura
+    const isAlertaTemp = alerta.mensagens && alerta.mensagens.some(msg => 
+        msg.includes('Temp ALTA') || msg.includes('Temp BAIXA')
+    );
+
+    if (isAlertaTemp && tempAtual !== -999) {
+        // Calcula limites
+        const diaHoje = moment(now).tz(TIMEZONE_CONFIG).day();
+        const isAltoFluxo = [3, 4].includes(diaHoje);
+        const LIMIT_TEMP_MAX = config.temp_max !== null ? config.temp_max : (isAltoFluxo ? -2.0 : -5.0);
+        const LIMIT_TEMP_MIN = config.temp_min !== null ? config.temp_min : -30.0;
+
+        // Verifica se temperatura está dentro do range válido
+        const dentroDoRange = tempAtual >= LIMIT_TEMP_MIN && tempAtual <= LIMIT_TEMP_MAX;
+        
+        if (dentroDoRange) {
+            logger.logInfo('N8N', `Alerta de temperatura descartado - temperatura já normalizada`, {
+                sensor: mac,
+                temp_atual: tempAtual,
+                limite_min: LIMIT_TEMP_MIN,
+                limite_max: LIMIT_TEMP_MAX,
+                mensagem: alerta.mensagens[0]
+            });
+            return false; // Descarta alerta - temperatura já está normal
+        }
+    }
+
+    // Verifica se é alerta de porta aberta
+    const isAlertaPorta = alerta.mensagens && alerta.mensagens.some(msg => 
+        msg.includes('PORTA ABERTA') || (alerta.dados_contexto?.tipo === 'PORTA_ABERTA')
+    );
+
+    if (isAlertaPorta) {
+        // Verifica se porta está fechada agora
+        const portaFechada = !state.alertControl.last_virtual_state;
+        
+        if (portaFechada) {
+            logger.logInfo('N8N', `Alerta de porta descartado - porta já está fechada`, {
+                sensor: mac,
+                mensagem: alerta.mensagens[0]
+            });
+            return false; // Descarta alerta - porta já está fechada
+        }
+    }
+
+    // Alerta ainda é válido
+    return true;
+}
+
+/**
  * Envia alertas para N8N em lote
  */
 setInterval(async () => {
@@ -306,15 +378,32 @@ setInterval(async () => {
     const payload = [...n8nAlertBuffer];
     n8nAlertBuffer.length = 0;
 
-    const prioridades = payload.reduce((acc, a) => {
+    // Valida alertas antes de enviar - remove os que já não são mais relevantes
+    const alertasValidos = payload.filter(alerta => validarAlertaAntesEnvio(alerta));
+    const alertasDescartados = payload.length - alertasValidos.length;
+
+    if (alertasDescartados > 0) {
+        logger.logInfo('N8N', `${alertasDescartados} alertas descartados por validação`, {
+            total_original: payload.length,
+            descartados: alertasDescartados,
+            validos: alertasValidos.length
+        });
+    }
+
+    if (alertasValidos.length === 0) {
+        logger.logDebug('N8N', 'Nenhum alerta válido para enviar após validação');
+        return;
+    }
+
+    const prioridades = alertasValidos.reduce((acc, a) => {
         acc[a.prioridade] = (acc[a.prioridade] || 0) + 1;
         return acc;
     }, {});
     
-    logger.logInfo('N8N', `Enviando ${payload.length} alertas acumulados`, {
-        total: payload.length,
+    logger.logInfo('N8N', `Enviando ${alertasValidos.length} alertas validados`, {
+        total: alertasValidos.length,
         prioridades,
-        sensores_unicos: new Set(payload.map(a => a.sensor_mac)).size
+        sensores_unicos: new Set(alertasValidos.map(a => a.sensor_mac)).size
     });
     
     try {
@@ -323,9 +412,9 @@ setInterval(async () => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
                 timestamp: new Date().toISOString(), 
-                total_alertas: payload.length, 
+                total_alertas: alertasValidos.length, 
                 is_batched: true, 
-                alertas: payload 
+                alertas: alertasValidos 
             })
         });
         
@@ -334,16 +423,17 @@ setInterval(async () => {
         }
         
         logger.logInfo('N8N', 'Alertas enviados com sucesso', {
-            total: payload.length,
+            total: alertasValidos.length,
             status: response.status
         });
     } catch (e) { 
         logger.logError('N8N', 'Falha ao enviar alertas', {
-            total: payload.length,
+            total: alertasValidos.length,
             error: e.message,
             stack: e.stack 
         });
-        n8nAlertBuffer.unshift(...payload);
+        // Em caso de erro, retorna apenas os alertas válidos ao buffer
+        n8nAlertBuffer.unshift(...alertasValidos);
     }
 }, BATCH_ALERT_INTERVAL_MS);
 

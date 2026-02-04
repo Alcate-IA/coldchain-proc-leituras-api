@@ -28,6 +28,7 @@ import {
     DB_MIN_VAR_HUM,
     DB_HEARTBEAT_MS,
     BATCH_ALERT_INTERVAL_MS,
+    ALERT_SOAK_TIME_MS,
     GATEWAY_TIMEOUT_MS,
     GATEWAY_CHECK_INTERVAL_MS
 } from './src/config/constants.js';
@@ -40,7 +41,7 @@ import { formatarMac, calcularBateria } from './src/utils/formatters.js';
 import sensorRepository from './src/repositories/SensorRepository.js';
 
 // Services
-import sensorService from './src/services/SensorService.js';
+import SensorService from './src/services/SensorService.js';
 import { HealthService } from './src/services/HealthService.js';
 
 // Controllers
@@ -64,6 +65,9 @@ const alertWatchlist = new Map();
 const dbTelemetryBuffer = [];
 const dbDoorBuffer = [];
 const n8nAlertBuffer = [];
+
+// Sensor Service (instanciado com watchlist)
+const sensorService = new SensorService(alertWatchlist);
 
 // Health Service
 const healthService = new HealthService(
@@ -379,6 +383,30 @@ setInterval(() => {
         }
     }
 }, 24 * 60 * 60 * 1000);
+
+/**
+ * Limpa watchlist de alertas antigos (mais de 2x o soak time)
+ * Remove entradas que já expiraram para evitar crescimento infinito da memória
+ */
+setInterval(() => {
+    const now = Date.now();
+    const cleanupThreshold = ALERT_SOAK_TIME_MS * 2; // Remove após 40 minutos (2x o soak time)
+    
+    let removidos = 0;
+    for (const [key, timestamp] of alertWatchlist.entries()) {
+        if ((now - timestamp) > cleanupThreshold) {
+            alertWatchlist.delete(key);
+            removidos++;
+        }
+    }
+    
+    if (removidos > 0) {
+        logger.logInfo('WATCHLIST', `Limpeza de watchlist: ${removidos} entradas removidas`, {
+            removidos,
+            restantes: alertWatchlist.size
+        });
+    }
+}, 30 * 60 * 1000); // Executa a cada 30 minutos
 
 // ============================================================================
 // MQTT

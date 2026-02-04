@@ -69,7 +69,7 @@ export const TUNING_ULTRA = {
 
 // Alerting & Infra
 export const BATCH_ALERT_INTERVAL_MS = 5 * 60 * 1000; 
-export const ALERT_SOAK_TIME_MS = 10 * 60 * 1000;      
+export const ALERT_SOAK_TIME_MS = 20 * 60 * 1000; // 20 minutos - período mínimo entre alertas do mesmo tipo      
 export const CALL_PERSISTENCE_MS = 30 * 60 * 1000;     
 export const EXTREME_DEVIATION_C = 10.0;               
 export const GATEWAY_TIMEOUT_MS = 15 * 60 * 1000; 
@@ -93,5 +93,6 @@ export const DOOR_DETECTION = {
     MIN_CLOSE_DURATION_MS: 60 * 1000, // Mínimo 60s para confirmar fechamento
     STABILITY_CHECK_POINTS: 3,        // Pontos necessários para estabilidade
     TEMP_RISE_CONFIRMATION: 1.0,      // Aumento mínimo para confirmar abertura
-    TEMP_DROP_CONFIRMATION: 0.5        // Queda mínima para confirmar fechamento
+    TEMP_DROP_CONFIRMATION: 0.5,      // Queda mínima para confirmar fechamento
+    MAX_OPEN_TIME_MS: 10 * 60 * 1000  // 10 minutos - tempo máximo antes de alertar porta aberta
 };

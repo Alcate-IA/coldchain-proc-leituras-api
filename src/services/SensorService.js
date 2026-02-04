@@ -8,16 +8,17 @@ import { DoorDetectionStrategy } from '../strategies/DoorDetectionStrategy.js';
 import { DefrostDetectionStrategy } from '../strategies/DefrostDetectionStrategy.js';
 import thermalAnalysisService from './ThermalAnalysisService.js';
 import { formatarMac, calcularBateria } from '../utils/formatters.js';
-import { TUNING_NORMAL, TUNING_ULTRA, EXTREME_DEVIATION_C, ALERT_SOAK_TIME_MS, CALL_PERSISTENCE_MS } from '../config/constants.js';
+import { TUNING_NORMAL, TUNING_ULTRA, EXTREME_DEVIATION_C, ALERT_SOAK_TIME_MS, CALL_PERSISTENCE_MS, DOOR_DETECTION } from '../config/constants.js';
 import moment from 'moment-timezone';
 import { TIMEZONE_CONFIG } from '../config/constants.js';
 import logger from '../utils/logger.js';
 
 export class SensorService {
-    constructor() {
+    constructor(alertWatchlist = null) {
         this.doorStrategy = new DoorDetectionStrategy();
         this.defrostStrategy = new DefrostDetectionStrategy();
         this.sensorStates = new Map();
+        this.alertWatchlist = alertWatchlist; // Watchlist para controle de duplicatas
     }
 
     /**
@@ -66,13 +67,16 @@ export class SensorService {
         // Detecção de porta
         const doorResult = this._processDoorDetection(iaStats, TUNING, state, val, now, nome, gatewayMac, leitura);
 
-        // Processa alertas
+        // Processa alertas de temperatura/umidade
         const alerta = this._processAlerts(iaStats, state, config, val, leitura, isUltra, now, nome);
+
+        // Processa alerta de porta aberta por muito tempo
+        const alertaPorta = this._processDoorOpenAlert(state, now, nome);
 
         return {
             defrost: defrostResult,
             door: doorResult,
-            alert: alerta
+            alert: alerta || alertaPorta // Retorna qualquer um dos alertas
         };
     }
 
@@ -157,24 +161,14 @@ export class SensorService {
 
     /**
      * Processa alertas de temperatura/umidade
+     * 
+     * NOTA: Alertas preditivos e de degelo foram removidos conforme requisito.
+     * Apenas alertas de temperatura/umidade fora dos limites são enviados.
+     * Implementa watchlist e soak time para evitar alertas duplicados.
      */
     _processAlerts(iaStats, state, config, val, leitura, isUltra, now, nome) {
-        // Durante degelo, suprime alertas normais
+        // Durante degelo, não envia alertas (suprime todos os alertas durante degelo)
         if (state.alertControl.is_defrosting) {
-            const defrostTolerance = isUltra ? 25.0 : 15.0;
-            const LIMIT_TEMP_MAX = config.temp_max !== null ? config.temp_max : -5.0;
-            
-            // Só alerta se temperatura ficar muito extrema durante degelo
-            if (val > (LIMIT_TEMP_MAX + defrostTolerance + 5.0)) {
-                return this._createAlert(
-                    nome,
-                    state.mac,
-                    `⚠️ DEGELO ANORMAL: ${val}°C`,
-                    'ALTA',
-                    now,
-                    { temp_atual: val, status_operacional: "EM_DEGELO" }
-                );
-            }
             return null;
         }
 
@@ -187,47 +181,66 @@ export class SensorService {
         let mensagemProblema = null;
         let prioridade = 'ALTA';
         let desvioExtremo = false;
+        let tipoAlerta = null; // Identificador do tipo de alerta para watchlist
 
+        // Apenas alerta se temperatura estiver fora dos limites (não preditivo)
         if (val < LIMIT_TEMP_MIN) {
             mensagemProblema = `Temp BAIXA: ${val}°C (Min: ${LIMIT_TEMP_MIN}°C)`;
-            if (val < (LIMIT_TEMP_MIN - EXTREME_DEVIATION_C)) desvioExtremo = true;
+            tipoAlerta = 'TEMP_BAIXA';
+            if (val < (LIMIT_TEMP_MIN - EXTREME_DEVIATION_C)) {
+                desvioExtremo = true;
+                prioridade = 'CRITICA';
+            }
         } else if (val > LIMIT_TEMP_MAX) {
             mensagemProblema = `Temp ALTA: ${val}°C (Max: ${LIMIT_TEMP_MAX}°C)`;
-            if (val > (LIMIT_TEMP_MAX + EXTREME_DEVIATION_C)) desvioExtremo = true;
-        } else if (iaStats.ready && iaStats.slope > 0.1 && iaStats.r2 > 0.6) {
-            // Alerta preditivo
-            const tempFutura15Min = val + (iaStats.slope * 15);
-            const diferencaProjetada = tempFutura15Min - LIMIT_TEMP_MAX;
-            
-            if (diferencaProjetada >= 10.0) {
-                const tempoRestante = (LIMIT_TEMP_MAX - val) / iaStats.slope;
-                if (tempoRestante > 0 && tempoRestante < 20) {
-                    mensagemProblema = `PREVISÃO CRÍTICA: Atingirá limite em ${Math.floor(tempoRestante)}min`;
-                    prioridade = 'CRITICA';
-                }
-            } else if (diferencaProjetada >= 5.0) {
-                const tempoRestante = (LIMIT_TEMP_MAX - val) / iaStats.slope;
-                if (tempoRestante > 0 && tempoRestante < 20) {
-                    mensagemProblema = `PREVISÃO: Atingirá limite em ${Math.floor(tempoRestante)}min`;
-                    prioridade = 'PREDITIVA';
-                }
+            tipoAlerta = 'TEMP_ALTA';
+            if (val > (LIMIT_TEMP_MAX + EXTREME_DEVIATION_C)) {
+                desvioExtremo = true;
+                prioridade = 'CRITICA';
             }
         }
+        // Removido: lógica de alertas preditivos (PREDITIVA e CRITICA)
 
         // Validação de umidade
         if (!mensagemProblema && leitura.humidity !== undefined) {
             const valHum = Number(leitura.humidity);
             if (config.hum_max && valHum > config.hum_max) {
                 mensagemProblema = `Umid ALTA: ${valHum}%`;
+                tipoAlerta = 'UMID_ALTA';
             } else if (config.hum_min && valHum < config.hum_min) {
                 mensagemProblema = `Umid BAIXA: ${valHum}%`;
+                tipoAlerta = 'UMID_BAIXA';
             }
         }
 
         if (!mensagemProblema) return null;
 
         // Gestão de watchlist e soak time
-        // (Implementação simplificada - pode ser expandida)
+        // Verifica se já existe alerta recente do mesmo tipo para este sensor
+        if (this.alertWatchlist) {
+            const watchlistKey = `${state.mac}_${tipoAlerta}`;
+            const lastAlertTime = this.alertWatchlist.get(watchlistKey);
+            
+            if (lastAlertTime && (now - lastAlertTime) < ALERT_SOAK_TIME_MS) {
+                const tempoRestante = Math.floor((ALERT_SOAK_TIME_MS - (now - lastAlertTime)) / 60000);
+                logger.logDebug('ALERTA', `Alerta suprimido por soak time: ${nome} - ${tipoAlerta}`, {
+                    sensor: state.mac,
+                    tipo: tipoAlerta,
+                    tempo_restante_min: tempoRestante,
+                    ultimo_alerta: new Date(lastAlertTime).toISOString()
+                });
+                return null; // Suprime alerta duplicado
+            }
+            
+            // Atualiza watchlist com timestamp do novo alerta
+            this.alertWatchlist.set(watchlistKey, now);
+            logger.logDebug('ALERTA', `Alerta adicionado à watchlist: ${nome} - ${tipoAlerta}`, {
+                sensor: state.mac,
+                tipo: tipoAlerta,
+                watchlist_size: this.alertWatchlist.size
+            });
+        }
+
         return this._createAlert(
             nome,
             state.mac,
@@ -245,6 +258,66 @@ export class SensorService {
                 } : { ready: false }
             }
         );
+    }
+
+    /**
+     * Processa alerta de porta aberta por muito tempo
+     */
+    _processDoorOpenAlert(state, now, nome) {
+        // Verifica se porta está aberta
+        if (!state.alertControl.last_virtual_state) {
+            return null;
+        }
+
+        // Verifica se está em degelo (não alerta durante degelo)
+        if (state.alertControl.is_defrosting) {
+            return null;
+        }
+
+        // Verifica há quanto tempo a porta está aberta
+        const portaAbertaDesde = state.alertControl.last_analysis_ts || now;
+        const tempoAberta = now - portaAbertaDesde;
+
+        // Se porta está aberta há mais que o tempo máximo configurado
+        if (tempoAberta > DOOR_DETECTION.MAX_OPEN_TIME_MS) {
+            const minutosAberta = Math.floor(tempoAberta / 60000);
+
+            // Verifica watchlist para evitar alertas duplicados
+            if (this.alertWatchlist) {
+                const watchlistKey = `${state.mac}_PORTA_ABERTA`;
+                const lastAlertTime = this.alertWatchlist.get(watchlistKey);
+                
+                if (lastAlertTime && (now - lastAlertTime) < ALERT_SOAK_TIME_MS) {
+                    const tempoRestante = Math.floor((ALERT_SOAK_TIME_MS - (now - lastAlertTime)) / 60000);
+                    logger.logDebug('ALERTA', `Alerta de porta suprimido por soak time: ${nome}`, {
+                        sensor: state.mac,
+                        tempo_restante_min: tempoRestante,
+                        minutos_aberta: minutosAberta
+                    });
+                    return null; // Suprime alerta duplicado
+                }
+                
+                // Atualiza watchlist
+                this.alertWatchlist.set(watchlistKey, now);
+            }
+
+            return this._createAlert(
+                nome,
+                state.mac,
+                `🚪 PORTA ABERTA há ${minutosAberta} minutos`,
+                'ALTA',
+                now,
+                {
+                    tipo: 'PORTA_ABERTA',
+                    minutos_aberta: minutosAberta,
+                    porta_aberta_desde: new Date(portaAbertaDesde).toISOString(),
+                    temp_atual: state.lastReading.db_temp,
+                    status_operacional: 'PORTA_ABERTA'
+                }
+            );
+        }
+
+        return null;
     }
 
     /**
@@ -300,4 +373,5 @@ export class SensorService {
     }
 }
 
-export default new SensorService();
+// Exporta a classe para permitir instanciação com watchlist
+export default SensorService;

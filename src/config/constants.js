@@ -71,7 +71,9 @@ export const TUNING_ULTRA = {
 export const BATCH_ALERT_INTERVAL_MS = 5 * 60 * 1000; 
 export const ALERT_SOAK_TIME_MS = 20 * 60 * 1000; // 20 minutos - período mínimo entre alertas do mesmo tipo      
 export const CALL_PERSISTENCE_MS = 30 * 60 * 1000;     
-export const EXTREME_DEVIATION_C = 10.0;               
+export const EXTREME_DEVIATION_C = 10.0;
+export const TEMP_MIN_THRESHOLD = 3.0; // Tolerância para temperatura mínima (ex: -5°C + 3°C = -2°C para alertar)
+export const TEMP_MAX_THRESHOLD = 3.0; // Tolerância para temperatura máxima (ex: -5°C - 3°C = -8°C para alertar)               
 export const GATEWAY_TIMEOUT_MS = 15 * 60 * 1000; 
 export const GATEWAY_CHECK_INTERVAL_MS = 60 * 1000;
 

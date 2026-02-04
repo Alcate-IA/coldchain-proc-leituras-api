@@ -8,7 +8,7 @@ import { DoorDetectionStrategy } from '../strategies/DoorDetectionStrategy.js';
 import { DefrostDetectionStrategy } from '../strategies/DefrostDetectionStrategy.js';
 import thermalAnalysisService from './ThermalAnalysisService.js';
 import { formatarMac, calcularBateria } from '../utils/formatters.js';
-import { TUNING_NORMAL, TUNING_ULTRA, EXTREME_DEVIATION_C, ALERT_SOAK_TIME_MS, CALL_PERSISTENCE_MS, DOOR_DETECTION } from '../config/constants.js';
+import { TUNING_NORMAL, TUNING_ULTRA, EXTREME_DEVIATION_C, ALERT_SOAK_TIME_MS, CALL_PERSISTENCE_MS, DOOR_DETECTION, TEMP_MIN_THRESHOLD, TEMP_MAX_THRESHOLD } from '../config/constants.js';
 import moment from 'moment-timezone';
 import { TIMEZONE_CONFIG } from '../config/constants.js';
 import logger from '../utils/logger.js';
@@ -183,16 +183,25 @@ export class SensorService {
         let desvioExtremo = false;
         let tipoAlerta = null; // Identificador do tipo de alerta para watchlist
 
-        // Apenas alerta se temperatura estiver fora dos limites (não preditivo)
-        if (val < LIMIT_TEMP_MIN) {
-            mensagemProblema = `Temp BAIXA: ${val}°C (Min: ${LIMIT_TEMP_MIN}°C)`;
+        // Calcula limites com tolerância (threshold)
+        // Para temperatura mínima: só alerta se estiver abaixo de (LIMIT_TEMP_MIN + THRESHOLD)
+        // Exemplo: se min = -5°C e threshold = 3°C, só alerta se temp < -2°C
+        const LIMIT_TEMP_MIN_ALERT = LIMIT_TEMP_MIN + TEMP_MIN_THRESHOLD;
+        
+        // Para temperatura máxima: só alerta se estiver acima de (LIMIT_TEMP_MAX - THRESHOLD)
+        // Exemplo: se max = -5°C e threshold = 3°C, só alerta se temp > -8°C
+        const LIMIT_TEMP_MAX_ALERT = LIMIT_TEMP_MAX - TEMP_MAX_THRESHOLD;
+
+        // Apenas alerta se temperatura estiver fora dos limites com tolerância (não preditivo)
+        if (val < LIMIT_TEMP_MIN_ALERT) {
+            mensagemProblema = `Temp BAIXA: ${val}°C (Min: ${LIMIT_TEMP_MIN}°C, Threshold: ${TEMP_MIN_THRESHOLD}°C)`;
             tipoAlerta = 'TEMP_BAIXA';
             if (val < (LIMIT_TEMP_MIN - EXTREME_DEVIATION_C)) {
                 desvioExtremo = true;
                 prioridade = 'CRITICA';
             }
-        } else if (val > LIMIT_TEMP_MAX) {
-            mensagemProblema = `Temp ALTA: ${val}°C (Max: ${LIMIT_TEMP_MAX}°C)`;
+        } else if (val > LIMIT_TEMP_MAX_ALERT) {
+            mensagemProblema = `Temp ALTA: ${val}°C (Max: ${LIMIT_TEMP_MAX}°C, Threshold: ${TEMP_MAX_THRESHOLD}°C)`;
             tipoAlerta = 'TEMP_ALTA';
             if (val > (LIMIT_TEMP_MAX + EXTREME_DEVIATION_C)) {
                 desvioExtremo = true;

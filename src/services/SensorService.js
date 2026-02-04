@@ -178,34 +178,50 @@ export class SensorService {
         const LIMIT_TEMP_MAX = config.temp_max !== null ? config.temp_max : (isAltoFluxo ? -2.0 : -5.0);
         const LIMIT_TEMP_MIN = config.temp_min !== null ? config.temp_min : -30.0;
 
+        // Primeiro verifica se está dentro do range válido
+        // Range válido: LIMIT_TEMP_MIN <= temp <= LIMIT_TEMP_MAX
+        const dentroDoRange = val >= LIMIT_TEMP_MIN && val <= LIMIT_TEMP_MAX;
+        
+        // Se estiver dentro do range, não gera alerta
+        if (dentroDoRange) {
+            return null;
+        }
+
         let mensagemProblema = null;
         let prioridade = 'ALTA';
         let desvioExtremo = false;
         let tipoAlerta = null; // Identificador do tipo de alerta para watchlist
 
-        // Calcula limites com tolerância (threshold)
-        // Para temperatura mínima: só alerta se estiver abaixo de (LIMIT_TEMP_MIN + THRESHOLD)
-        // Exemplo: se min = -5°C e threshold = 3°C, só alerta se temp < -2°C
-        const LIMIT_TEMP_MIN_ALERT = LIMIT_TEMP_MIN + TEMP_MIN_THRESHOLD;
+        // Calcula limites com tolerância (threshold) apenas para valores FORA do range
+        // Para temperatura BAIXA: só alerta se estiver MUITO abaixo do mínimo
+        // Exemplo: se min = -30°C e threshold = 3°C, só alerta se temp < -33°C
+        const LIMIT_TEMP_MIN_ALERT = LIMIT_TEMP_MIN - TEMP_MIN_THRESHOLD;
         
-        // Para temperatura máxima: só alerta se estiver acima de (LIMIT_TEMP_MAX - THRESHOLD)
-        // Exemplo: se max = -5°C e threshold = 3°C, só alerta se temp > -8°C
-        const LIMIT_TEMP_MAX_ALERT = LIMIT_TEMP_MAX - TEMP_MAX_THRESHOLD;
+        // Para temperatura ALTA: só alerta se estiver MUITO acima do máximo
+        // Exemplo: se max = -5°C e threshold = 3°C, só alerta se temp > -2°C
+        // (para valores negativos, "acima" significa mais próximo de zero)
+        const LIMIT_TEMP_MAX_ALERT = LIMIT_TEMP_MAX + TEMP_MAX_THRESHOLD;
 
-        // Apenas alerta se temperatura estiver fora dos limites com tolerância (não preditivo)
-        if (val < LIMIT_TEMP_MIN_ALERT) {
-            mensagemProblema = `Temp BAIXA: ${val}°C (Min: ${LIMIT_TEMP_MIN}°C, Threshold: ${TEMP_MIN_THRESHOLD}°C)`;
-            tipoAlerta = 'TEMP_BAIXA';
-            if (val < (LIMIT_TEMP_MIN - EXTREME_DEVIATION_C)) {
-                desvioExtremo = true;
-                prioridade = 'CRITICA';
+        // Verifica se temperatura está fora dos limites E ultrapassou o threshold
+        if (val < LIMIT_TEMP_MIN) {
+            // Está abaixo do mínimo, verifica se ultrapassou o threshold
+            if (val < LIMIT_TEMP_MIN_ALERT) {
+                mensagemProblema = `Temp BAIXA: ${val}°C (Min: ${LIMIT_TEMP_MIN}°C, Threshold: ${TEMP_MIN_THRESHOLD}°C)`;
+                tipoAlerta = 'TEMP_BAIXA';
+                if (val < (LIMIT_TEMP_MIN - EXTREME_DEVIATION_C)) {
+                    desvioExtremo = true;
+                    prioridade = 'CRITICA';
+                }
             }
-        } else if (val > LIMIT_TEMP_MAX_ALERT) {
-            mensagemProblema = `Temp ALTA: ${val}°C (Max: ${LIMIT_TEMP_MAX}°C, Threshold: ${TEMP_MAX_THRESHOLD}°C)`;
-            tipoAlerta = 'TEMP_ALTA';
-            if (val > (LIMIT_TEMP_MAX + EXTREME_DEVIATION_C)) {
-                desvioExtremo = true;
-                prioridade = 'CRITICA';
+        } else if (val > LIMIT_TEMP_MAX) {
+            // Está acima do máximo, verifica se ultrapassou o threshold
+            if (val > LIMIT_TEMP_MAX_ALERT) {
+                mensagemProblema = `Temp ALTA: ${val}°C (Max: ${LIMIT_TEMP_MAX}°C, Threshold: ${TEMP_MAX_THRESHOLD}°C)`;
+                tipoAlerta = 'TEMP_ALTA';
+                if (val > (LIMIT_TEMP_MAX + EXTREME_DEVIATION_C)) {
+                    desvioExtremo = true;
+                    prioridade = 'CRITICA';
+                }
             }
         }
         // Removido: lógica de alertas preditivos (PREDITIVA e CRITICA)
